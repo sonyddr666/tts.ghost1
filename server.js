@@ -4,103 +4,38 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   mkdir,
   readFile,
-  writeFile,
+  rename,
   unlink,
+  writeFile,
 } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 // ============================================================
-// CONFIGURAÇÃO
+// UTILITÁRIOS DE CONFIGURAÇÃO
 // ============================================================
 
-const PORT = numberEnv('PORT', 7979);
-
-const SECRET_KEY = stringEnv('SECRET_KEY');
-const INWORLD_API_KEY = stringEnv('INWORLD_API_KEY');
-
-const MODEL_ID = stringEnv('MODEL_ID', 'inworld-tts-2');
-const AUDIO_ENCODING = stringEnv('AUDIO_ENCODING', 'MP3').toUpperCase();
-const SAMPLE_RATE_HERTZ = numberEnv('SAMPLE_RATE_HERTZ', 48000);
-const DELIVERY_MODE = stringEnv('DELIVERY_MODE', 'BALANCED');
-const TEXT_NORMALIZATION = stringEnv('TEXT_NORMALIZATION', 'ON');
-
-const TELEGRAM_BOT_TOKEN = stringEnv('TELEGRAM_BOT_TOKEN');
-
-const TELEGRAM_ALLOWED_CHAT_IDS = new Set(
-  stringEnv('TELEGRAM_ALLOWED_CHAT_IDS')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean)
-);
-
-const TELEGRAM_DEFAULT_VOICE = stringEnv(
-  'TELEGRAM_DEFAULT_VOICE',
-  'Beatriz'
-);
-
-const TELEGRAM_DEFAULT_LANGUAGE = normalizeLanguage(
-  stringEnv('TELEGRAM_DEFAULT_LANGUAGE', 'PT_BR')
-);
-
-const TELEGRAM_SEND_MODE = normalizeSendMode(
-  stringEnv('TELEGRAM_SEND_MODE', 'audio')
-);
-
-const TELEGRAM_MAX_TEXT_CHARS = numberEnv(
-  'TELEGRAM_MAX_TEXT_CHARS',
-  4096
-);
-
-const CLONE_MIN_SECONDS = numberEnv(
-  'CLONE_MIN_SECONDS',
-  5
-);
-
-const CLONE_MAX_SECONDS = numberEnv(
-  'CLONE_MAX_SECONDS',
-  15
-);
-
-const CLONE_SAMPLE_RATE_HERTZ = numberEnv(
-  'CLONE_SAMPLE_RATE_HERTZ',
-  24000
-);
-
-const CLONE_REMOVE_BACKGROUND_NOISE =
-  boolEnv('CLONE_REMOVE_BACKGROUND_NOISE', true);
-
-const DATA_DIR = stringEnv('DATA_DIR', '/app/data');
-const STATE_FILE = path.join(DATA_DIR, 'telegram-state.json');
-
-const INWORLD_AUTH = INWORLD_API_KEY.startsWith('Basic ')
-  ? INWORLD_API_KEY
-  : `Basic ${INWORLD_API_KEY}`;
-
-const TELEGRAM_API = TELEGRAM_BOT_TOKEN
-  ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
-  : '';
-
-const missing = Object.entries({
-  SECRET_KEY,
-  INWORLD_API_KEY,
-})
-  .filter(([, value]) => !value)
-  .map(([key]) => key);
-
-if (missing.length > 0) {
-  console.error(
-    `Faltando variável obrigatória: ${missing.join(', ')}`
-  );
-  process.exit(1);
+function stringEnv(name, fallback = '') {
+  const value = process.env[name];
+  return value == null ? fallback : String(value).trim();
 }
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers':
-    'Content-Type, x-secret, Authorization',
-};
+function numberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function boolEnv(name, fallback) {
+  const value = process.env[name];
+
+  if (value == null || value === '') {
+    return fallback;
+  }
+
+  return ['1', 'true', 'yes', 'on', 'sim'].includes(
+    String(value).trim().toLowerCase()
+  );
+}
 
 const LANGUAGE_ALIASES = {
   pt: 'PT_BR',
@@ -147,165 +82,28 @@ const LANGUAGE_ALIASES = {
   hi_in: 'HI_IN',
 };
 
-const state = {
-  chats: {},
-};
-
-let voicesCache = {
-  expiresAt: 0,
-  byLanguage: new Map(),
-};
-
-const callbackVoices = new Map();
-
-// ============================================================
-// UTILITÁRIOS
-// ============================================================
-
-function stringEnv(name, fallback = '') {
-  const value = process.env[name];
-  return value == null
-    ? fallback
-    : String(value).trim();
-}
-
-function numberEnv(name, fallback) {
-  const value = Number(process.env[name]);
-
-  return Number.isFinite(value)
-    ? value
-    : fallback;
-}
-
-function boolEnv(name, fallback) {
-  const value = process.env[name];
-
-  if (value == null || value === '') {
-    return fallback;
-  }
-
-  return ['1', 'true', 'yes', 'on'].includes(
-    String(value).toLowerCase()
-  );
-}
-
 function normalizeLanguage(value) {
   if (!value) {
     return 'PT_BR';
   }
 
-  const normalized = String(value)
-    .trim()
-    .toLowerCase();
+  const normalized = String(value).trim().toLowerCase();
 
   return (
     LANGUAGE_ALIASES[normalized] ||
-    String(value)
-      .trim()
-      .toUpperCase()
-      .replace('-', '_')
+    String(value).trim().toUpperCase().replaceAll('-', '_')
   );
 }
 
 function normalizeSendMode(value) {
-  const normalized = String(value).toLowerCase();
-
-  return (
-    normalized === 'voice' ||
-    normalized === 'voz'
-  )
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'voice' || normalized === 'voz'
     ? 'voice'
     : 'audio';
 }
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function sendJson(res, status, data, extraHeaders = {}) {
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    ...CORS,
-    ...extraHeaders,
-  });
-
-  res.end(JSON.stringify(data));
-}
-
-function sendError(res, status, message, details) {
-  const payload = { error: message };
-
-  if (details !== undefined) {
-    payload.details = details;
-  }
-
-  sendJson(res, status, payload);
-}
-
-async function readJson(req) {
-  let body = '';
-
-  for await (const chunk of req) {
-    body += chunk;
-
-    if (body.length > 12_000_000) {
-      throw new Error(
-        'Corpo da requisição muito grande'
-      );
-    }
-  }
-
-  return body
-    ? JSON.parse(body)
-    : {};
-}
-
-function isAuthorized(req, body = {}) {
-  const headerSecret = req.headers['x-secret'];
-
-  const bearer =
-    req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.slice(7)
-      : '';
-
-  return (
-    body.chavesecreta === SECRET_KEY ||
-    headerSecret === SECRET_KEY ||
-    bearer === SECRET_KEY
-  );
-}
-
-function contentTypeForEncoding(encoding) {
-  const normalized = String(encoding).toUpperCase();
-
-  if (normalized === 'MP3') {
-    return 'audio/mpeg';
-  }
-
-  if (
-    normalized === 'OGG_OPUS' ||
-    normalized === 'OPUS'
-  ) {
-    return 'audio/ogg';
-  }
-
-  if (normalized === 'MULAW') {
-    return 'audio/basic';
-  }
-
-  return 'audio/wav';
-}
-
-function extensionForContentType(contentType) {
-  if (contentType === 'audio/mpeg') {
-    return 'mp3';
-  }
-
-  if (contentType === 'audio/ogg') {
-    return 'ogg';
-  }
-
-  return 'wav';
 }
 
 function safeError(error) {
@@ -318,11 +116,131 @@ function safeError(error) {
   }
 
   if (error.data) {
-    return JSON.stringify(error.data);
+    try {
+      return JSON.stringify(error.data);
+    } catch {
+      return String(error.data);
+    }
   }
 
   return error.message || String(error);
 }
+
+// ============================================================
+// CONFIGURAÇÃO
+// ============================================================
+
+const PORT = numberEnv('PORT', 7979);
+
+const SECRET_KEY = stringEnv('SECRET_KEY');
+const INWORLD_API_KEY = stringEnv('INWORLD_API_KEY');
+
+const MODEL_ID = stringEnv('MODEL_ID', 'inworld-tts-2');
+const AUDIO_ENCODING = stringEnv('AUDIO_ENCODING', 'MP3').toUpperCase();
+const SAMPLE_RATE_HERTZ = numberEnv('SAMPLE_RATE_HERTZ', 48000);
+const DELIVERY_MODE = stringEnv('DELIVERY_MODE', 'BALANCED');
+const TEXT_NORMALIZATION = stringEnv('TEXT_NORMALIZATION', 'ON');
+const INWORLD_TIMEOUT_MS = numberEnv('INWORLD_TIMEOUT_MS', 120000);
+const PROCESS_TIMEOUT_MS = numberEnv('PROCESS_TIMEOUT_MS', 180000);
+
+const TELEGRAM_BOT_TOKEN = stringEnv('TELEGRAM_BOT_TOKEN');
+const TELEGRAM_ALLOWED_CHAT_IDS = new Set(
+  stringEnv('TELEGRAM_ALLOWED_CHAT_IDS')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+);
+const TELEGRAM_DEFAULT_VOICE = stringEnv(
+  'TELEGRAM_DEFAULT_VOICE',
+  'Beatriz'
+);
+const TELEGRAM_DEFAULT_LANGUAGE = normalizeLanguage(
+  stringEnv('TELEGRAM_DEFAULT_LANGUAGE', 'PT_BR')
+);
+const TELEGRAM_SEND_MODE = normalizeSendMode(
+  stringEnv('TELEGRAM_SEND_MODE', 'audio')
+);
+const TELEGRAM_MAX_TEXT_CHARS = numberEnv(
+  'TELEGRAM_MAX_TEXT_CHARS',
+  4096
+);
+
+const CLONE_MIN_SECONDS = numberEnv('CLONE_MIN_SECONDS', 5);
+const CLONE_MAX_SECONDS = numberEnv('CLONE_MAX_SECONDS', 15);
+const CLONE_SAMPLE_RATE_HERTZ = numberEnv(
+  'CLONE_SAMPLE_RATE_HERTZ',
+  24000
+);
+const CLONE_REMOVE_BACKGROUND_NOISE = boolEnv(
+  'CLONE_REMOVE_BACKGROUND_NOISE',
+  true
+);
+
+const DATA_DIR = stringEnv('DATA_DIR', '/app/data');
+const STATE_FILE = path.join(DATA_DIR, 'telegram-state.json');
+
+const INWORLD_AUTH = INWORLD_API_KEY.startsWith('Basic ')
+  ? INWORLD_API_KEY
+  : `Basic ${INWORLD_API_KEY}`;
+
+const TELEGRAM_API = TELEGRAM_BOT_TOKEN
+  ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
+  : '';
+
+const missing = Object.entries({
+  SECRET_KEY,
+  INWORLD_API_KEY,
+})
+  .filter(([, value]) => !value)
+  .map(([key]) => key);
+
+if (missing.length > 0) {
+  console.error(`Faltando variável obrigatória: ${missing.join(', ')}`);
+  process.exit(1);
+}
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  console.error(`PORT inválida: ${PORT}`);
+  process.exit(1);
+}
+
+if (CLONE_MIN_SECONDS <= 0 || CLONE_MAX_SECONDS < CLONE_MIN_SECONDS) {
+  console.error(
+    'Configuração inválida: CLONE_MAX_SECONDS deve ser maior ou igual a CLONE_MIN_SECONDS.'
+  );
+  process.exit(1);
+}
+
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, x-secret, Authorization',
+};
+
+// ============================================================
+// ESTADO
+// ============================================================
+
+const state = {
+  chats: {},
+};
+
+let saveStateQueue = Promise.resolve();
+
+let voicesCache = {
+  expiresAt: 0,
+  byLanguage: new Map(),
+};
+
+const callbackVoices = new Map();
+
+const telegramRuntime = {
+  enabled: Boolean(TELEGRAM_BOT_TOKEN),
+  configured: false,
+  polling: false,
+  lastUpdateAt: null,
+  lastError: null,
+};
 
 async function loadState() {
   await mkdir(DATA_DIR, { recursive: true });
@@ -331,30 +249,28 @@ async function loadState() {
     const raw = await readFile(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw);
 
-    if (
-      parsed?.chats &&
-      typeof parsed.chats === 'object'
-    ) {
+    if (parsed?.chats && typeof parsed.chats === 'object') {
       state.chats = parsed.chats;
     }
   } catch (error) {
     if (error.code !== 'ENOENT') {
-      console.error(
-        '[state] não foi possível carregar:',
-        error
-      );
+      console.error('[state] não foi possível carregar:', safeError(error));
     }
   }
 }
 
-async function saveState() {
-  await mkdir(DATA_DIR, { recursive: true });
+function saveState() {
+  saveStateQueue = saveStateQueue
+    .catch(() => {})
+    .then(async () => {
+      await mkdir(DATA_DIR, { recursive: true });
 
-  await writeFile(
-    STATE_FILE,
-    JSON.stringify(state, null, 2),
-    'utf8'
-  );
+      const tempFile = `${STATE_FILE}.${randomUUID()}.tmp`;
+      await writeFile(tempFile, JSON.stringify(state, null, 2), 'utf8');
+      await rename(tempFile, STATE_FILE);
+    });
+
+  return saveStateQueue;
 }
 
 function getChatState(chatId) {
@@ -378,9 +294,101 @@ function isTelegramChatAllowed(chatId) {
     return true;
   }
 
-  return TELEGRAM_ALLOWED_CHAT_IDS.has(
-    String(chatId)
+  return TELEGRAM_ALLOWED_CHAT_IDS.has(String(chatId));
+}
+
+// ============================================================
+// HTTP
+// ============================================================
+
+function sendJson(res, status, data, extraHeaders = {}) {
+  const payload = JSON.stringify(data);
+
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+    ...CORS,
+    ...extraHeaders,
+  });
+
+  res.end(payload);
+}
+
+function sendError(res, status, message, details) {
+  const payload = { error: message };
+
+  if (details !== undefined) {
+    payload.details = details;
+  }
+
+  sendJson(res, status, payload);
+}
+
+async function readJson(req, maxBytes = 12_000_000) {
+  const chunks = [];
+  let size = 0;
+
+  for await (const chunk of req) {
+    size += chunk.length;
+
+    if (size > maxBytes) {
+      const error = new Error('Corpo da requisição muito grande');
+      error.status = 413;
+      throw error;
+    }
+
+    chunks.push(chunk);
+  }
+
+  if (chunks.length === 0) {
+    return {};
+  }
+
+  const raw = Buffer.concat(chunks).toString('utf8');
+  return JSON.parse(raw);
+}
+
+function isAuthorized(req, body = {}) {
+  const headerSecret = req.headers['x-secret'];
+  const bearer = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.slice(7)
+    : '';
+
+  return (
+    body.chavesecreta === SECRET_KEY ||
+    headerSecret === SECRET_KEY ||
+    bearer === SECRET_KEY
   );
+}
+
+function contentTypeForEncoding(encoding) {
+  const normalized = String(encoding).toUpperCase();
+
+  if (normalized === 'MP3') {
+    return 'audio/mpeg';
+  }
+
+  if (normalized === 'OGG_OPUS' || normalized === 'OPUS') {
+    return 'audio/ogg';
+  }
+
+  if (normalized === 'MULAW') {
+    return 'audio/basic';
+  }
+
+  return 'audio/wav';
+}
+
+function extensionForContentType(contentType) {
+  if (contentType === 'audio/mpeg') {
+    return 'mp3';
+  }
+
+  if (contentType === 'audio/ogg') {
+    return 'ogg';
+  }
+
+  return 'wav';
 }
 
 // ============================================================
@@ -388,41 +396,50 @@ function isTelegramChatAllowed(chatId) {
 // ============================================================
 
 async function inworldRequest(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: INWORLD_AUTH,
-      ...(options.body
-        ? { 'Content-Type': 'application/json' }
-        : {}),
-      ...(options.headers || {}),
-    },
-  });
-
-  const raw = await response.text();
-
-  let data;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INWORLD_TIMEOUT_MS);
 
   try {
-    data = raw
-      ? JSON.parse(raw)
-      : {};
-  } catch {
-    data = { raw };
-  }
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        Authorization: INWORLD_AUTH,
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(options.headers || {}),
+      },
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    const error = new Error(
-      `Inworld respondeu HTTP ${response.status}`
-    );
+    const raw = await response.text();
+    let data;
 
-    error.status = response.status;
-    error.data = data;
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = { raw };
+    }
+
+    if (!response.ok) {
+      const error = new Error(`Inworld respondeu HTTP ${response.status}`);
+      error.status = response.status;
+      error.data = data;
+      throw error;
+    }
+
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      const timeoutError = new Error(
+        `A Inworld excedeu o tempo limite de ${INWORLD_TIMEOUT_MS}ms`
+      );
+      timeoutError.status = 504;
+      throw timeoutError;
+    }
 
     throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return data;
 }
 
 async function synthesizeSpeech({
@@ -449,7 +466,7 @@ async function synthesizeSpeech({
   };
 
   if (language) {
-    payload.language = language;
+    payload.language = normalizeLanguage(language);
   }
 
   if (Number.isFinite(Number(temperature))) {
@@ -467,37 +484,29 @@ async function synthesizeSpeech({
   const result = response.result || response;
 
   if (!result.audioContent) {
-    throw new Error(
-      'A Inworld não retornou audioContent'
-    );
+    throw new Error('A Inworld não retornou audioContent');
   }
 
   return {
-    audio: Buffer.from(
-      result.audioContent,
-      'base64'
-    ),
+    audio: Buffer.from(result.audioContent, 'base64'),
     usage: result.usage || {},
     audioEncoding,
-    modelId:
-      result.usage?.modelId ||
-      modelId,
+    modelId: result.usage?.modelId || modelId,
   };
 }
 
 function splitText(text, maxLength = 1800) {
-  const clean = String(text)
-    .replace(/\s+/g, ' ')
-    .trim();
+  const clean = String(text).replace(/\s+/g, ' ').trim();
+
+  if (!clean) {
+    return [];
+  }
 
   if (clean.length <= maxLength) {
     return [clean];
   }
 
-  const sentences =
-    clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ||
-    [clean];
-
+  const sentences = clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [clean];
   const chunks = [];
   let current = '';
 
@@ -508,10 +517,7 @@ function splitText(text, maxLength = 1800) {
       continue;
     }
 
-    if (
-      current &&
-      `${current} ${sentence}`.length <= maxLength
-    ) {
+    if (current && `${current} ${sentence}`.length <= maxLength) {
       current += ` ${sentence}`;
       continue;
     }
@@ -529,19 +535,13 @@ function splitText(text, maxLength = 1800) {
     let remaining = sentence;
 
     while (remaining.length > maxLength) {
-      let cut = remaining.lastIndexOf(
-        ' ',
-        maxLength
-      );
+      let cut = remaining.lastIndexOf(' ', maxLength);
 
       if (cut < maxLength * 0.5) {
         cut = maxLength;
       }
 
-      chunks.push(
-        remaining.slice(0, cut).trim()
-      );
-
+      chunks.push(remaining.slice(0, cut).trim());
       remaining = remaining.slice(cut).trim();
     }
 
@@ -555,37 +555,40 @@ function splitText(text, maxLength = 1800) {
   return chunks;
 }
 
-async function synthesizeLongSpeech({
-  text,
-  voiceId,
-  modelId,
-}) {
+async function synthesizeLongSpeech({ text, voiceId, modelId }) {
   const chunks = splitText(text, 1800);
-  const audioParts = [];
 
-  for (let index = 0; index < chunks.length; index += 1) {
+  if (chunks.length === 0) {
+    throw new Error('Texto vazio');
+  }
+
+  const audioParts = [];
+  let usedModelId = modelId;
+
+  for (const chunk of chunks) {
     const generated = await synthesizeSpeech({
-      text: chunks[index],
+      text: chunk,
       voiceId,
       modelId,
       audioEncoding: 'MP3',
       sampleRateHertz: SAMPLE_RATE_HERTZ,
     });
 
+    usedModelId = generated.modelId || usedModelId;
     audioParts.push(generated.audio);
   }
 
   if (audioParts.length === 1) {
     return {
       audio: audioParts[0],
-      modelId,
+      modelId: usedModelId,
       chunks: 1,
     };
   }
 
   return {
     audio: await concatenateMp3Buffers(audioParts),
-    modelId,
+    modelId: usedModelId,
     chunks: audioParts.length,
   };
 }
@@ -593,36 +596,17 @@ async function synthesizeLongSpeech({
 async function listVoices(language) {
   const normalizedLanguage = normalizeLanguage(language);
   const now = Date.now();
+  const cached = voicesCache.byLanguage.get(normalizedLanguage);
 
-  const cached = voicesCache.byLanguage.get(
-    normalizedLanguage
-  );
-
-  if (
-    cached &&
-    voicesCache.expiresAt > now
-  ) {
+  if (cached && voicesCache.expiresAt > now) {
     return cached;
   }
 
-  const url = new URL(
-    'https://api.inworld.ai/voices/v1/voices'
-  );
+  const url = new URL('https://api.inworld.ai/voices/v1/voices');
+  url.searchParams.append('languages', normalizedLanguage);
 
-  if (normalizedLanguage) {
-    url.searchParams.append(
-      'languages',
-      normalizedLanguage
-    );
-  }
-
-  const result = await inworldRequest(
-    url.toString()
-  );
-
-  const voices = Array.isArray(result.voices)
-    ? result.voices
-    : [];
+  const result = await inworldRequest(url.toString());
+  const voices = Array.isArray(result.voices) ? result.voices : [];
 
   if (voicesCache.expiresAt <= now) {
     voicesCache = {
@@ -631,48 +615,23 @@ async function listVoices(language) {
     };
   }
 
-  voicesCache.byLanguage.set(
-    normalizedLanguage,
-    voices
-  );
-
+  voicesCache.byLanguage.set(normalizedLanguage, voices);
   return voices;
 }
 
-async function getVoicePreview(
-  voiceId,
-  modelId
-) {
-  const url = new URL(
-    'https://api.inworld.ai/tts/v1/voice:preview'
-  );
+async function getVoicePreview(voiceId, modelId) {
+  const url = new URL('https://api.inworld.ai/tts/v1/voice:preview');
+  url.searchParams.set('voice_id', voiceId);
+  url.searchParams.set('model_id', modelId);
 
-  url.searchParams.set(
-    'voice_id',
-    voiceId
-  );
-
-  url.searchParams.set(
-    'model_id',
-    modelId
-  );
-
-  const response = await inworldRequest(
-    url.toString()
-  );
-
+  const response = await inworldRequest(url.toString());
   const result = response.result || response;
 
   if (!result.audioContent) {
-    throw new Error(
-      'A Inworld não retornou preview'
-    );
+    throw new Error('A Inworld não retornou preview');
   }
 
-  return Buffer.from(
-    result.audioContent,
-    'base64'
-  );
+  return Buffer.from(result.audioContent, 'base64');
 }
 
 async function cloneVoice({
@@ -697,14 +656,9 @@ async function cloneVoice({
     description:
       description ||
       `Voz clonada pelo Ghost1 TTS em ${new Date().toISOString()}.`,
-    tags: [
-      'ghost1',
-      'telegram',
-      'clone',
-    ],
+    tags: ['ghost1', 'telegram', 'clone'],
     audioProcessingConfig: {
-      removeBackgroundNoise:
-        CLONE_REMOVE_BACKGROUND_NOISE,
+      removeBackgroundNoise: CLONE_REMOVE_BACKGROUND_NOISE,
     },
   };
 
@@ -720,9 +674,7 @@ async function cloneVoice({
   const voice = result.voice;
 
   if (!voice?.voiceId) {
-    throw new Error(
-      'A Inworld não retornou o voiceId da voz clonada'
-    );
+    throw new Error('A Inworld não retornou o voiceId da voz clonada');
   }
 
   voicesCache.expiresAt = 0;
@@ -730,8 +682,7 @@ async function cloneVoice({
 
   return {
     voice,
-    audioSamplesValidated:
-      result.audioSamplesValidated || [],
+    audioSamplesValidated: result.audioSamplesValidated || [],
   };
 }
 
@@ -739,18 +690,27 @@ async function cloneVoice({
 // PROCESSAMENTO DE ÁUDIO
 // ============================================================
 
-function runProcess(command, args) {
+function runProcess(command, args, timeoutMs = PROCESS_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      stdio: [
-        'ignore',
-        'pipe',
-        'pipe',
-      ],
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     let stdout = '';
     let stderr = '';
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      child.kill('SIGKILL');
+      reject(
+        new Error(`${command} excedeu o tempo limite de ${timeoutMs}ms`)
+      );
+    }, timeoutMs);
 
     child.stdout.on('data', chunk => {
       stdout += chunk.toString();
@@ -760,151 +720,116 @@ function runProcess(command, args) {
       stderr += chunk.toString();
     });
 
-    child.on('error', reject);
+    child.on('error', error => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
 
     child.on('close', code => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeout);
+
       if (code === 0) {
         resolve({ stdout, stderr });
         return;
       }
 
-      reject(
-        new Error(
-          `${command} saiu com código ${code}: ${stderr}`
-        )
-      );
+      reject(new Error(`${command} saiu com código ${code}: ${stderr}`));
     });
   });
 }
 
 async function audioDurationSeconds(filePath) {
-  const { stdout } = await runProcess(
-    'ffprobe',
-    [
-      '-v',
-      'error',
-      '-show_entries',
-      'format=duration',
-      '-of',
-      'default=noprint_wrappers=1:nokey=1',
-      filePath,
-    ]
-  );
+  const { stdout } = await runProcess('ffprobe', [
+    '-v',
+    'error',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ]);
 
-  const duration = Number.parseFloat(
-    stdout.trim()
-  );
-
-  return Number.isFinite(duration)
-    ? duration
-    : 0;
+  const duration = Number.parseFloat(stdout.trim());
+  return Number.isFinite(duration) ? duration : 0;
 }
 
 async function concatenateMp3Buffers(buffers) {
   const id = randomUUID();
   const tempDir = os.tmpdir();
   const partPaths = [];
-  const listPath = path.join(
-    tempDir,
-    `ghost1-${id}-list.txt`
-  );
-  const outputPath = path.join(
-    tempDir,
-    `ghost1-${id}-combined.mp3`
-  );
+  const listPath = path.join(tempDir, `ghost1-${id}-list.txt`);
+  const outputPath = path.join(tempDir, `ghost1-${id}-combined.mp3`);
 
   try {
-    for (
-      let index = 0;
-      index < buffers.length;
-      index += 1
-    ) {
-      const partPath = path.join(
-        tempDir,
-        `ghost1-${id}-${index}.mp3`
-      );
-
-      await writeFile(
-        partPath,
-        buffers[index]
-      );
-
+    for (let index = 0; index < buffers.length; index += 1) {
+      const partPath = path.join(tempDir, `ghost1-${id}-${index}.mp3`);
+      await writeFile(partPath, buffers[index]);
       partPaths.push(partPath);
     }
 
     await writeFile(
       listPath,
-      partPaths
-        .map(filePath => `file '${filePath}'`)
-        .join('\n'),
+      partPaths.map(filePath => `file '${filePath}'`).join('\n'),
       'utf8'
     );
 
     try {
-      await runProcess(
-        'ffmpeg',
-        [
-          '-y',
-          '-f',
-          'concat',
-          '-safe',
-          '0',
-          '-i',
-          listPath,
-          '-c',
-          'copy',
-          outputPath,
-        ]
-      );
+      await runProcess('ffmpeg', [
+        '-y',
+        '-f',
+        'concat',
+        '-safe',
+        '0',
+        '-i',
+        listPath,
+        '-c',
+        'copy',
+        outputPath,
+      ]);
     } catch {
-      await runProcess(
-        'ffmpeg',
-        [
-          '-y',
-          '-f',
-          'concat',
-          '-safe',
-          '0',
-          '-i',
-          listPath,
-          '-c:a',
-          'libmp3lame',
-          '-b:a',
-          '128k',
-          outputPath,
-        ]
-      );
+      await runProcess('ffmpeg', [
+        '-y',
+        '-f',
+        'concat',
+        '-safe',
+        '0',
+        '-i',
+        listPath,
+        '-c:a',
+        'libmp3lame',
+        '-b:a',
+        '128k',
+        outputPath,
+      ]);
     }
 
     return await readFile(outputPath);
   } finally {
     await Promise.allSettled(
-      [
-        ...partPaths,
-        listPath,
-        outputPath,
-      ].map(filePath => unlink(filePath))
+      [...partPaths, listPath, outputPath].map(filePath => unlink(filePath))
     );
   }
 }
 
-async function prepareGeneratedAudio(
-  inputBuffer,
-  sendMode
-) {
+async function prepareGeneratedAudio(inputBuffer, sendMode) {
   const id = randomUUID();
   const tempDir = os.tmpdir();
-
-  const inputPath = path.join(
-    tempDir,
-    `ghost1-${id}-input.mp3`
-  );
+  const inputPath = path.join(tempDir, `ghost1-${id}-input.mp3`);
 
   await writeFile(inputPath, inputBuffer);
 
   try {
-    const duration =
-      await audioDurationSeconds(inputPath);
+    const duration = await audioDurationSeconds(inputPath);
 
     if (sendMode !== 'voice') {
       return {
@@ -915,28 +840,22 @@ async function prepareGeneratedAudio(
       };
     }
 
-    const outputPath = path.join(
-      tempDir,
-      `ghost1-${id}-voice.ogg`
-    );
+    const outputPath = path.join(tempDir, `ghost1-${id}-voice.ogg`);
 
     try {
-      await runProcess(
-        'ffmpeg',
-        [
-          '-y',
-          '-i',
-          inputPath,
-          '-vn',
-          '-c:a',
-          'libopus',
-          '-b:a',
-          '64k',
-          '-vbr',
-          'on',
-          outputPath,
-        ]
-      );
+      await runProcess('ffmpeg', [
+        '-y',
+        '-i',
+        inputPath,
+        '-vn',
+        '-c:a',
+        'libopus',
+        '-b:a',
+        '64k',
+        '-vbr',
+        'on',
+        outputPath,
+      ]);
 
       return {
         buffer: await readFile(outputPath),
@@ -945,74 +864,50 @@ async function prepareGeneratedAudio(
         duration,
       };
     } finally {
-      await unlink(outputPath)
-        .catch(() => {});
+      await unlink(outputPath).catch(() => {});
     }
   } finally {
-    await unlink(inputPath)
-      .catch(() => {});
+    await unlink(inputPath).catch(() => {});
   }
 }
 
-async function prepareCloneSample(
-  inputBuffer
-) {
+async function prepareCloneSample(inputBuffer) {
   const id = randomUUID();
   const tempDir = os.tmpdir();
-
-  const inputPath = path.join(
-    tempDir,
-    `ghost1-${id}-clone-input`
-  );
-
-  const outputPath = path.join(
-    tempDir,
-    `ghost1-${id}-clone.wav`
-  );
+  const inputPath = path.join(tempDir, `ghost1-${id}-clone-input`);
+  const outputPath = path.join(tempDir, `ghost1-${id}-clone.wav`);
 
   await writeFile(inputPath, inputBuffer);
 
   try {
-    const originalDuration =
-      await audioDurationSeconds(inputPath);
+    const originalDuration = await audioDurationSeconds(inputPath);
 
-    if (
-      originalDuration <
-      CLONE_MIN_SECONDS
-    ) {
+    if (originalDuration < CLONE_MIN_SECONDS) {
       throw new Error(
         `A amostra tem ${originalDuration.toFixed(1)}s. Envie pelo menos ${CLONE_MIN_SECONDS}s de voz.`
       );
     }
 
-    const wasTrimmed =
-      originalDuration >
-      CLONE_MAX_SECONDS;
+    const wasTrimmed = originalDuration > CLONE_MAX_SECONDS;
 
-    await runProcess(
-      'ffmpeg',
-      [
-        '-y',
-        '-i',
-        inputPath,
-        '-t',
-        String(CLONE_MAX_SECONDS),
-        '-vn',
-        '-ac',
-        '1',
-        '-ar',
-        String(CLONE_SAMPLE_RATE_HERTZ),
-        '-c:a',
-        'pcm_s16le',
-        outputPath,
-      ]
-    );
+    await runProcess('ffmpeg', [
+      '-y',
+      '-i',
+      inputPath,
+      '-t',
+      String(CLONE_MAX_SECONDS),
+      '-vn',
+      '-ac',
+      '1',
+      '-ar',
+      String(CLONE_SAMPLE_RATE_HERTZ),
+      '-c:a',
+      'pcm_s16le',
+      outputPath,
+    ]);
 
-    const wavBuffer =
-      await readFile(outputPath);
-
-    const finalDuration =
-      await audioDurationSeconds(outputPath);
+    const wavBuffer = await readFile(outputPath);
+    const finalDuration = await audioDurationSeconds(outputPath);
 
     return {
       wavBuffer,
@@ -1021,15 +916,12 @@ async function prepareCloneSample(
       wasTrimmed,
     };
   } finally {
-    await Promise.allSettled([
-      unlink(inputPath),
-      unlink(outputPath),
-    ]);
+    await Promise.allSettled([unlink(inputPath), unlink(outputPath)]);
   }
 }
 
 // ============================================================
-// API HTTP
+// ROTAS DA API HTTP
 // ============================================================
 
 async function handleSynthesize(req, res) {
@@ -1040,33 +932,21 @@ async function handleSynthesize(req, res) {
   } catch (error) {
     return sendError(
       res,
-      400,
+      error.status || 400,
       'JSON inválido',
       error.message
     );
   }
 
   if (!isAuthorized(req, body)) {
-    return sendError(
-      res,
-      401,
-      'Chave secreta inválida'
-    );
+    return sendError(res, 401, 'Chave secreta inválida');
   }
 
   const text = body.texto ?? body.text;
-  const voiceId =
-    body.voz ?? body.voiceId;
+  const voiceId = body.voz ?? body.voiceId;
 
-  if (
-    !text ||
-    typeof text !== 'string'
-  ) {
-    return sendError(
-      res,
-      400,
-      'Campo "texto" obrigatório'
-    );
+  if (!text || typeof text !== 'string') {
+    return sendError(res, 400, 'Campo "texto" obrigatório');
   }
 
   if (text.length > 2000) {
@@ -1077,74 +957,42 @@ async function handleSynthesize(req, res) {
     );
   }
 
-  if (
-    !voiceId ||
-    typeof voiceId !== 'string'
-  ) {
-    return sendError(
-      res,
-      400,
-      'Campo "voz" obrigatório'
-    );
+  if (!voiceId || typeof voiceId !== 'string') {
+    return sendError(res, 400, 'Campo "voz" obrigatório');
   }
 
   try {
     const result = await synthesizeSpeech({
       text,
       voiceId,
-      modelId:
-        body.model ??
-        body.modelId ??
-        MODEL_ID,
-      audioEncoding:
-        body.audioEncoding ??
-        AUDIO_ENCODING,
-      sampleRateHertz:
-        body.sampleRateHertz ??
-        SAMPLE_RATE_HERTZ,
-      deliveryMode:
-        body.deliveryMode ??
-        DELIVERY_MODE,
+      modelId: body.model ?? body.modelId ?? MODEL_ID,
+      audioEncoding: body.audioEncoding ?? AUDIO_ENCODING,
+      sampleRateHertz: body.sampleRateHertz ?? SAMPLE_RATE_HERTZ,
+      deliveryMode: body.deliveryMode ?? DELIVERY_MODE,
       applyTextNormalization:
-        body.applyTextNormalization ??
-        TEXT_NORMALIZATION,
+        body.applyTextNormalization ?? TEXT_NORMALIZATION,
       language: body.language,
       temperature: body.temperature,
     });
 
-    const contentType =
-      contentTypeForEncoding(
-        result.audioEncoding
-      );
-
-    const extension =
-      extensionForContentType(
-        contentType
-      );
+    const contentType = contentTypeForEncoding(result.audioEncoding);
+    const extension = extensionForContentType(contentType);
 
     res.writeHead(200, {
       'Content-Type': contentType,
-      'Content-Length':
-        result.audio.length,
-      'Content-Disposition':
-        `inline; filename="audio.${extension}"`,
+      'Content-Length': result.audio.length,
+      'Content-Disposition': `inline; filename="audio.${extension}"`,
       'Cache-Control': 'no-store',
-      'X-Inworld-Model':
-        result.modelId,
+      'X-Inworld-Model': result.modelId,
       'X-Inworld-Characters': String(
-        result.usage
-          ?.processedCharactersCount ??
-        text.length
+        result.usage?.processedCharactersCount ?? text.length
       ),
       ...CORS,
     });
 
     res.end(result.audio);
   } catch (error) {
-    console.error(
-      '[TTS]',
-      safeError(error)
-    );
+    console.error('[TTS]', safeError(error));
 
     return sendError(
       res,
@@ -1157,32 +1005,20 @@ async function handleSynthesize(req, res) {
 
 async function handleVoices(req, res, url) {
   if (!isAuthorized(req)) {
-    return sendError(
-      res,
-      401,
-      'Chave secreta inválida'
-    );
+    return sendError(res, 401, 'Chave secreta inválida');
   }
 
   try {
     const language =
       url.searchParams.get('language') ||
       url.searchParams.get('lang') ||
-      url.searchParams.get('languages');
+      url.searchParams.get('languages') ||
+      TELEGRAM_DEFAULT_LANGUAGE;
 
-    const voices =
-      await listVoices(language);
-
-    return sendJson(
-      res,
-      200,
-      { voices }
-    );
+    const voices = await listVoices(language);
+    return sendJson(res, 200, { voices });
   } catch (error) {
-    console.error(
-      '[VOICES]',
-      safeError(error)
-    );
+    console.error('[VOICES]', safeError(error));
 
     return sendError(
       res,
@@ -1195,42 +1031,27 @@ async function handleVoices(req, res, url) {
 
 async function handlePreview(req, res, url) {
   if (!isAuthorized(req)) {
-    return sendError(
-      res,
-      401,
-      'Chave secreta inválida'
-    );
+    return sendError(res, 401, 'Chave secreta inválida');
   }
 
   const voiceId =
-    url.searchParams.get('voiceId') ||
-    url.searchParams.get('voz');
-
+    url.searchParams.get('voiceId') || url.searchParams.get('voz');
   const modelId =
     url.searchParams.get('modelId') ||
     url.searchParams.get('model') ||
     MODEL_ID;
 
   if (!voiceId) {
-    return sendError(
-      res,
-      400,
-      'Parâmetro voiceId obrigatório'
-    );
+    return sendError(res, 400, 'Parâmetro voiceId obrigatório');
   }
 
   try {
-    const audio =
-      await getVoicePreview(
-        voiceId,
-        modelId
-      );
+    const audio = await getVoicePreview(voiceId, modelId);
 
     res.writeHead(200, {
       'Content-Type': 'audio/mpeg',
       'Content-Length': audio.length,
-      'Content-Disposition':
-        'inline; filename="preview.mp3"',
+      'Content-Disposition': 'inline; filename="preview.mp3"',
       'Cache-Control': 'no-store',
       ...CORS,
     });
@@ -1254,79 +1075,47 @@ async function handleClone(req, res) {
   } catch (error) {
     return sendError(
       res,
-      400,
+      error.status || 400,
       'JSON inválido',
       error.message
     );
   }
 
   if (!isAuthorized(req, body)) {
-    return sendError(
-      res,
-      401,
-      'Chave secreta inválida'
-    );
+    return sendError(res, 401, 'Chave secreta inválida');
   }
 
-  const audioBase64 =
-    body.audioData ||
-    body.audioBase64;
+  const audioBase64 = body.audioData || body.audioBase64;
 
-  if (!audioBase64) {
-    return sendError(
-      res,
-      400,
-      'Campo audioData em Base64 obrigatório'
-    );
+  if (!audioBase64 || typeof audioBase64 !== 'string') {
+    return sendError(res, 400, 'Campo audioData em Base64 obrigatório');
   }
 
-  if (!body.displayName) {
-    return sendError(
-      res,
-      400,
-      'Campo displayName obrigatório'
-    );
+  if (!body.displayName || typeof body.displayName !== 'string') {
+    return sendError(res, 400, 'Campo displayName obrigatório');
   }
 
   try {
-    const processed =
-      await prepareCloneSample(
-        Buffer.from(
-          audioBase64,
-          'base64'
-        )
-      );
+    const processed = await prepareCloneSample(
+      Buffer.from(audioBase64, 'base64')
+    );
 
     const result = await cloneVoice({
-      displayName:
-        body.displayName,
-      langCode:
-        body.langCode ||
-        body.language ||
-        'PT_BR',
-      wavBuffer:
-        processed.wavBuffer,
-      transcription:
-        body.transcription,
-      description:
-        body.description,
+      displayName: body.displayName,
+      langCode: body.langCode || body.language || 'PT_BR',
+      wavBuffer: processed.wavBuffer,
+      transcription: body.transcription,
+      description: body.description,
     });
 
-    return sendJson(
-      res,
-      200,
-      {
-        ...result,
-        sample: {
-          originalDuration:
-            processed.originalDuration,
-          finalDuration:
-            processed.finalDuration,
-          wasTrimmed:
-            processed.wasTrimmed,
-        },
-      }
-    );
+    return sendJson(res, 200, {
+      ...result,
+      sample: {
+        originalDuration: processed.originalDuration,
+        finalDuration: processed.finalDuration,
+        wasTrimmed: processed.wasTrimmed,
+      },
+    });
   } catch (error) {
     return sendError(
       res,
@@ -1341,69 +1130,69 @@ async function handleClone(req, res) {
 // TELEGRAM
 // ============================================================
 
-async function telegramRequest(
-  method,
-  body,
-  timeoutMs = 35000
-) {
+async function telegramRequest(method, options = {}, timeoutMs = 35000) {
   if (!TELEGRAM_BOT_TOKEN) {
-    throw new Error(
-      'TELEGRAM_BOT_TOKEN não configurado'
-    );
+    throw new Error('TELEGRAM_BOT_TOKEN não configurado');
   }
 
-  const response = await fetch(
-    `${TELEGRAM_API}/${method}`,
-    {
-      method: body
-        ? 'POST'
-        : 'GET',
-      body,
-      signal:
-        AbortSignal.timeout(timeoutMs),
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${TELEGRAM_API}/${method}`, {
+      method: 'POST',
+      ...options,
+      signal: controller.signal,
+    });
+
+    const raw = await response.text();
+    let data;
+
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = { ok: false, description: raw || 'Resposta inválida do Telegram' };
     }
-  );
 
-  const data = await response.json();
+    if (!response.ok || !data.ok) {
+      const error = new Error(
+        data.description || `Telegram HTTP ${response.status}`
+      );
+      error.status = response.status;
+      error.data = data;
+      throw error;
+    }
 
-  if (
-    !response.ok ||
-    !data.ok
-  ) {
-    const error = new Error(
-      data.description ||
-      `Telegram HTTP ${response.status}`
-    );
-
-    error.status = response.status;
-    error.data = data;
+    return data.result;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      const timeoutError = new Error(
+        `Telegram excedeu o tempo limite de ${timeoutMs}ms`
+      );
+      timeoutError.status = 504;
+      throw timeoutError;
+    }
 
     throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return data.result;
 }
 
-async function telegramJson(
-  method,
-  payload,
-  timeoutMs = 35000
-) {
+function telegramJson(method, payload, timeoutMs = 35000) {
   return telegramRequest(
     method,
-    new Blob(
-      [JSON.stringify(payload)],
-      { type: 'application/json' }
-    ),
+    {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    },
     timeoutMs
   );
 }
 
-async function sendTelegramMessage(
-  chatId,
-  text,
-  extra = {}
-) {
+async function sendTelegramMessage(chatId, text, extra = {}) {
   return telegramJson(
     'sendMessage',
     {
@@ -1416,10 +1205,7 @@ async function sendTelegramMessage(
   );
 }
 
-async function sendTelegramAction(
-  chatId,
-  action
-) {
+async function sendTelegramAction(chatId, action) {
   try {
     await telegramJson(
       'sendChatAction',
@@ -1430,20 +1216,16 @@ async function sendTelegramAction(
       10000
     );
   } catch {
-    // Efeito visual apenas.
+    // É apenas um indicador visual.
   }
 }
 
-async function answerCallbackQuery(
-  callbackQueryId,
-  text
-) {
+async function answerCallbackQuery(callbackQueryId, text) {
   try {
     await telegramJson(
       'answerCallbackQuery',
       {
-        callback_query_id:
-          callbackQueryId,
+        callback_query_id: callbackQueryId,
         text,
       },
       10000
@@ -1460,74 +1242,43 @@ async function sendTelegramAudio(
   sendMode
 ) {
   const form = new FormData();
-
-  form.append(
-    'chat_id',
-    String(chatId)
-  );
-
-  form.append(
-    'caption',
-    caption
-  );
-
+  form.append('chat_id', String(chatId));
+  form.append('caption', caption.slice(0, 1024));
   form.append(
     'duration',
-    String(
-      Math.max(
-        0,
-        Math.round(
-          preparedAudio.duration
-        )
-      )
-    )
+    String(Math.max(0, Math.round(preparedAudio.duration || 0)))
   );
 
-  const blob = new Blob(
-    [preparedAudio.buffer],
-    { type: preparedAudio.mimeType }
-  );
+  const blob = new Blob([preparedAudio.buffer], {
+    type: preparedAudio.mimeType,
+  });
 
   if (sendMode === 'voice') {
-    form.append(
-      'voice',
-      blob,
-      preparedAudio.filename
-    );
+    form.append('voice', blob, preparedAudio.filename);
 
     return telegramRequest(
       'sendVoice',
-      form,
+      {
+        body: form,
+      },
       120000
     );
   }
 
-  form.append(
-    'audio',
-    blob,
-    preparedAudio.filename
-  );
-
-  form.append(
-    'title',
-    'Ghost1 TTS'
-  );
-
-  form.append(
-    'performer',
-    'Inworld'
-  );
+  form.append('audio', blob, preparedAudio.filename);
+  form.append('title', 'Ghost1 TTS');
+  form.append('performer', 'Inworld');
 
   return telegramRequest(
     'sendAudio',
-    form,
+    {
+      body: form,
+    },
     120000
   );
 }
 
-async function downloadTelegramFile(
-  fileId
-) {
+async function downloadTelegramFile(fileId) {
   const file = await telegramJson(
     'getFile',
     {
@@ -1536,23 +1287,25 @@ async function downloadTelegramFile(
     15000
   );
 
-  const response = await fetch(
-    `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`,
-    {
-      signal:
-        AbortSignal.timeout(60000),
-    }
-  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
 
-  if (!response.ok) {
-    throw new Error(
-      `Falha ao baixar arquivo do Telegram: HTTP ${response.status}`
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`,
+      { signal: controller.signal }
     );
-  }
 
-  return Buffer.from(
-    await response.arrayBuffer()
-  );
+    if (!response.ok) {
+      throw new Error(
+        `Falha ao baixar arquivo do Telegram: HTTP ${response.status}`
+      );
+    }
+
+    return Buffer.from(await response.arrayBuffer());
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function telegramMenu(chatState) {
@@ -1568,7 +1321,9 @@ function telegramMenu(chatState) {
     '',
     `Voz atual: ${chatState.voiceId}`,
     `Modelo: ${chatState.modelId}`,
-    `Formato: ${chatState.sendMode === 'voice' ? 'mensagem de voz' : 'arquivo MP3'}`,
+    `Formato: ${
+      chatState.sendMode === 'voice' ? 'mensagem de voz' : 'arquivo MP3'
+    }`,
     '',
     'Comandos:',
     '/vozes pt - escolher voz',
@@ -1604,55 +1359,38 @@ function telegramStatus(chatState) {
 
 function callbackTokenForVoice(voice) {
   const hash = createHash('sha256')
-    .update(
-      `${voice.voiceId}:${Date.now()}:${Math.random()}`
-    )
+    .update(`${voice.voiceId}:${Date.now()}:${Math.random()}`)
     .digest('base64url')
     .slice(0, 18);
 
-  callbackVoices.set(hash, voice);
+  if (callbackVoices.size > 1000) {
+    callbackVoices.clear();
+  }
 
+  callbackVoices.set(hash, voice);
   return hash;
 }
 
-async function sendVoiceKeyboard(
-  chatId,
-  language
-) {
-  const normalizedLanguage =
-    normalizeLanguage(language);
-
-  const voices = await listVoices(
-    normalizedLanguage
-  );
+async function sendVoiceKeyboard(chatId, language) {
+  const normalizedLanguage = normalizeLanguage(language);
+  const voices = await listVoices(normalizedLanguage);
 
   if (voices.length === 0) {
     await sendTelegramMessage(
       chatId,
       `Nenhuma voz encontrada para ${normalizedLanguage}.`
     );
-
     return;
   }
 
   const visible = voices.slice(0, 40);
   const buttons = [];
 
-  for (
-    let index = 0;
-    index < visible.length;
-    index += 2
-  ) {
-    const row = visible
-      .slice(index, index + 2)
-      .map(voice => ({
-        text:
-          voice.displayName ||
-          voice.voiceId ||
-          voice.name,
-        callback_data:
-          `voice:${callbackTokenForVoice(voice)}`,
-      }));
+  for (let index = 0; index < visible.length; index += 2) {
+    const row = visible.slice(index, index + 2).map(voice => ({
+      text: voice.displayName || voice.voiceId || voice.name || 'Voz',
+      callback_data: `voice:${callbackTokenForVoice(voice)}`,
+    }));
 
     buttons.push(row);
   }
@@ -1672,54 +1410,37 @@ async function sendVoiceKeyboard(
   );
 }
 
-async function generateAndSendTelegramAudio(
-  chatId,
-  text,
-  chatState
-) {
-  const cleanText =
-    String(text || '').trim();
+async function generateAndSendTelegramAudio(chatId, text, chatState) {
+  const cleanText = String(text || '').trim();
 
   if (!cleanText) {
-    await sendTelegramMessage(
-      chatId,
-      'Envie algum texto para gerar o áudio.'
-    );
-
+    await sendTelegramMessage(chatId, 'Envie algum texto para gerar o áudio.');
     return;
   }
 
-  if (
-    cleanText.length >
-    TELEGRAM_MAX_TEXT_CHARS
-  ) {
+  if (cleanText.length > TELEGRAM_MAX_TEXT_CHARS) {
     await sendTelegramMessage(
       chatId,
       `Texto grande demais. Máximo no Telegram: ${TELEGRAM_MAX_TEXT_CHARS} caracteres.`
     );
-
     return;
   }
 
   await sendTelegramAction(
     chatId,
-    chatState.sendMode === 'voice'
-      ? 'record_voice'
-      : 'upload_audio'
+    chatState.sendMode === 'voice' ? 'record_voice' : 'upload_audio'
   );
 
-  const generated =
-    await synthesizeLongSpeech({
-      text: cleanText,
-      voiceId: chatState.voiceId,
-      modelId: chatState.modelId,
-    });
+  const generated = await synthesizeLongSpeech({
+    text: cleanText,
+    voiceId: chatState.voiceId,
+    modelId: chatState.modelId,
+  });
 
-  const prepared =
-    await prepareGeneratedAudio(
-      generated.audio,
-      chatState.sendMode
-    );
+  const prepared = await prepareGeneratedAudio(
+    generated.audio,
+    chatState.sendMode
+  );
 
   const caption = [
     `🎙️ ${chatState.voiceId}`,
@@ -1744,32 +1465,15 @@ function parseCloneCommand(argument, chatState) {
     .split('|')
     .map(value => value.trim());
 
-  const displayName = parts[0];
-  const langCode =
-    normalizeLanguage(
-      parts[1] ||
-      chatState.language
-    );
-
-  const transcription =
-    parts.slice(2).join(' | ').trim();
-
   return {
-    displayName,
-    langCode,
-    transcription,
+    displayName: parts[0],
+    langCode: normalizeLanguage(parts[1] || chatState.language),
+    transcription: parts.slice(2).join(' | ').trim(),
   };
 }
 
-async function handleCloneAudio(
-  chatId,
-  message,
-  chatState
-) {
-  const source =
-    message.voice ||
-    message.audio ||
-    message.document;
+async function handleCloneAudio(chatId, message, chatState) {
+  const source = message.voice || message.audio || message.document;
 
   if (!source?.file_id) {
     return false;
@@ -1789,8 +1493,7 @@ async function handleCloneAudio(
     return true;
   }
 
-  const mimeType =
-    source.mime_type || '';
+  const mimeType = source.mime_type || '';
 
   if (
     message.document &&
@@ -1801,56 +1504,38 @@ async function handleCloneAudio(
       chatId,
       'O documento enviado não parece ser um arquivo de áudio.'
     );
-
     return true;
   }
 
   try {
-    await sendTelegramAction(
-      chatId,
-      'typing'
-    );
-
+    await sendTelegramAction(chatId, 'typing');
     await sendTelegramMessage(
       chatId,
       '🔄 Baixando e preparando a amostra para clonagem...'
     );
 
-    const originalBuffer =
-      await downloadTelegramFile(
-        source.file_id
-      );
-
-    const processed =
-      await prepareCloneSample(
-        originalBuffer
-      );
+    const originalBuffer = await downloadTelegramFile(source.file_id);
+    const processed = await prepareCloneSample(originalBuffer);
 
     await sendTelegramMessage(
       chatId,
       processed.wasTrimmed
-        ? `A amostra tinha ${processed.originalDuration.toFixed(1)}s e foi cortada para ${CLONE_MAX_SECONDS}s, somente para a clonagem.`
+        ? `A amostra tinha ${processed.originalDuration.toFixed(
+            1
+          )}s e foi cortada para ${CLONE_MAX_SECONDS}s, somente para a clonagem.`
         : `Amostra aceita: ${processed.finalDuration.toFixed(1)}s.`
     );
 
     const cloned = await cloneVoice({
-      displayName:
-        chatState.pendingClone.displayName,
-      langCode:
-        chatState.pendingClone.langCode,
-      wavBuffer:
-        processed.wavBuffer,
-      transcription:
-        chatState.pendingClone.transcription,
+      displayName: chatState.pendingClone.displayName,
+      langCode: chatState.pendingClone.langCode,
+      wavBuffer: processed.wavBuffer,
+      transcription: chatState.pendingClone.transcription,
     });
 
-    chatState.voiceId =
-      cloned.voice.voiceId;
-
+    chatState.voiceId = cloned.voice.voiceId;
     chatState.language =
-      cloned.voice.langCode ||
-      chatState.pendingClone.langCode;
-
+      cloned.voice.langCode || chatState.pendingClone.langCode;
     chatState.pendingClone = null;
 
     await saveState();
@@ -1859,9 +1544,9 @@ async function handleCloneAudio(
       chatId,
       [
         '✅ VOZ CLONADA',
-        `Nome: ${cloned.voice.displayName}`,
+        `Nome: ${cloned.voice.displayName || 'Voz clonada'}`,
         `Voice ID: ${cloned.voice.voiceId}`,
-        `Idioma: ${cloned.voice.langCode}`,
+        `Idioma: ${cloned.voice.langCode || chatState.language}`,
         '',
         'A voz clonada já foi selecionada.',
         'Agora envie qualquer texto ou use /teste.',
@@ -1870,10 +1555,7 @@ async function handleCloneAudio(
       ].join('\n')
     );
   } catch (error) {
-    console.error(
-      '[telegram clone]',
-      safeError(error)
-    );
+    console.error('[telegram clone]', safeError(error));
 
     await sendTelegramMessage(
       chatId,
@@ -1884,61 +1566,31 @@ async function handleCloneAudio(
   return true;
 }
 
-async function handleTelegramCommand(
-  chatId,
-  text
-) {
-  const [rawCommand, ...args] =
-    text.trim().split(/\s+/);
-
-  const command =
-    rawCommand
-      .split('@')[0]
-      .toLowerCase();
-
-  const argument =
-    args.join(' ').trim();
-
-  const chatState =
-    getChatState(chatId);
+async function handleTelegramCommand(chatId, text) {
+  const [rawCommand, ...args] = text.trim().split(/\s+/);
+  const command = rawCommand.split('@')[0].toLowerCase();
+  const argument = args.join(' ').trim();
+  const chatState = getChatState(chatId);
 
   if (
     command === '/start' ||
     command === '/ajuda' ||
     command === '/help'
   ) {
-    await sendTelegramMessage(
-      chatId,
-      telegramMenu(chatState)
-    );
-
+    await sendTelegramMessage(chatId, telegramMenu(chatState));
     return;
   }
 
   if (command === '/status') {
-    await sendTelegramMessage(
-      chatId,
-      telegramStatus(chatState)
-    );
-
+    await sendTelegramMessage(chatId, telegramStatus(chatState));
     return;
   }
 
   if (command === '/vozes') {
-    const language =
-      normalizeLanguage(
-        argument ||
-        chatState.language
-      );
-
+    const language = normalizeLanguage(argument || chatState.language);
     chatState.language = language;
     await saveState();
-
-    await sendVoiceKeyboard(
-      chatId,
-      language
-    );
-
+    await sendVoiceKeyboard(chatId, language);
     return;
   }
 
@@ -1948,18 +1600,12 @@ async function handleTelegramCommand(
         chatId,
         `Voz atual: ${chatState.voiceId}\nUse /voz Beatriz ou /vozes pt`
       );
-
       return;
     }
 
     chatState.voiceId = argument;
     await saveState();
-
-    await sendTelegramMessage(
-      chatId,
-      `✅ Voz alterada para: ${argument}`
-    );
-
+    await sendTelegramMessage(chatId, `✅ Voz alterada para: ${argument}`);
     return;
   }
 
@@ -1969,59 +1615,40 @@ async function handleTelegramCommand(
         chatId,
         `Modelo atual: ${chatState.modelId}`
       );
-
       return;
     }
 
     chatState.modelId = argument;
     await saveState();
-
-    await sendTelegramMessage(
-      chatId,
-      `✅ Modelo alterado para: ${argument}`
-    );
-
+    await sendTelegramMessage(chatId, `✅ Modelo alterado para: ${argument}`);
     return;
   }
 
   if (command === '/modo') {
     if (
       !argument ||
-      ![
-        'audio',
-        'voz',
-        'voice',
-      ].includes(
-        argument.toLowerCase()
-      )
+      !['audio', 'voz', 'voice'].includes(argument.toLowerCase())
     ) {
-      await sendTelegramMessage(
-        chatId,
-        'Use /modo audio ou /modo voz'
-      );
-
+      await sendTelegramMessage(chatId, 'Use /modo audio ou /modo voz');
       return;
     }
 
-    chatState.sendMode =
-      normalizeSendMode(argument);
-
+    chatState.sendMode = normalizeSendMode(argument);
     await saveState();
 
     await sendTelegramMessage(
       chatId,
-      `✅ Formato alterado para: ${chatState.sendMode === 'voice' ? 'mensagem de voz' : 'arquivo MP3'}`
+      `✅ Formato alterado para: ${
+        chatState.sendMode === 'voice'
+          ? 'mensagem de voz'
+          : 'arquivo MP3'
+      }`
     );
-
     return;
   }
 
   if (command === '/clonar') {
-    const cloneConfig =
-      parseCloneCommand(
-        argument,
-        chatState
-      );
+    const cloneConfig = parseCloneCommand(argument, chatState);
 
     if (!cloneConfig.displayName) {
       await sendTelegramMessage(
@@ -2037,13 +1664,10 @@ async function handleTelegramCommand(
           'Envie somente uma voz que você tenha autorização para clonar.',
         ].join('\n')
       );
-
       return;
     }
 
-    chatState.pendingClone =
-      cloneConfig;
-
+    chatState.pendingClone = cloneConfig;
     await saveState();
 
     await sendTelegramMessage(
@@ -2061,39 +1685,27 @@ async function handleTelegramCommand(
         'A geração TTS posterior não será cortada.',
       ].join('\n')
     );
-
     return;
   }
 
   if (command === '/cancelar') {
     chatState.pendingClone = null;
     await saveState();
-
-    await sendTelegramMessage(
-      chatId,
-      'Clonagem cancelada.'
-    );
-
+    await sendTelegramMessage(chatId, 'Clonagem cancelada.');
     return;
   }
 
   if (command === '/preview') {
-    await sendTelegramAction(
-      chatId,
-      'upload_audio'
+    await sendTelegramAction(chatId, 'upload_audio');
+
+    const preview = await getVoicePreview(
+      chatState.voiceId,
+      chatState.modelId
     );
-
-    const preview =
-      await getVoicePreview(
-        chatState.voiceId,
-        chatState.modelId
-      );
-
-    const prepared =
-      await prepareGeneratedAudio(
-        preview,
-        chatState.sendMode
-      );
+    const prepared = await prepareGeneratedAudio(
+      preview,
+      chatState.sendMode
+    );
 
     await sendTelegramAudio(
       chatId,
@@ -2101,7 +1713,6 @@ async function handleTelegramCommand(
       `Preview: ${chatState.voiceId}`,
       chatState.sendMode
     );
-
     return;
   }
 
@@ -2111,7 +1722,6 @@ async function handleTelegramCommand(
       'Olá! Este é um teste do Ghost1 TTS usando a voz selecionada.',
       chatState
     );
-
     return;
   }
 
@@ -2122,126 +1732,77 @@ async function handleTelegramCommand(
 }
 
 async function handleTelegramMessage(message) {
-  const chatId =
-    message?.chat?.id;
+  const chatId = message?.chat?.id;
 
   if (!chatId) {
     return;
   }
 
   if (!isTelegramChatAllowed(chatId)) {
-    await sendTelegramMessage(
-      chatId,
-      '⛔ Este chat não está autorizado.'
-    );
-
+    await sendTelegramMessage(chatId, '⛔ Este chat não está autorizado.');
     return;
   }
 
-  const chatState =
-    getChatState(chatId);
-
-  const handledAudio =
-    await handleCloneAudio(
-      chatId,
-      message,
-      chatState
-    );
+  const chatState = getChatState(chatId);
+  const handledAudio = await handleCloneAudio(chatId, message, chatState);
 
   if (handledAudio) {
     return;
   }
 
-  const text =
-    message.text?.trim();
+  const text = message.text?.trim();
 
   if (!text) {
     await sendTelegramMessage(
       chatId,
       'Envie texto para gerar áudio ou use /clonar antes de enviar uma amostra de voz.'
     );
-
     return;
   }
 
   try {
     if (text.startsWith('/')) {
-      await handleTelegramCommand(
-        chatId,
-        text
-      );
-
+      await handleTelegramCommand(chatId, text);
       return;
     }
 
-    await generateAndSendTelegramAudio(
-      chatId,
-      text,
-      chatState
-    );
+    await generateAndSendTelegramAudio(chatId, text, chatState);
   } catch (error) {
-    console.error(
-      '[telegram message]',
-      safeError(error)
-    );
+    console.error('[telegram message]', safeError(error));
 
     await sendTelegramMessage(
       chatId,
       `❌ Não foi possível concluir.\n${safeError(error)}`
-    );
+    ).catch(() => {});
   }
 }
 
-async function handleTelegramCallback(
-  callbackQuery
-) {
-  const chatId =
-    callbackQuery
-      ?.message
-      ?.chat
-      ?.id;
+async function handleTelegramCallback(callbackQuery) {
+  const chatId = callbackQuery?.message?.chat?.id;
+  const data = callbackQuery?.data || '';
 
-  const data =
-    callbackQuery?.data || '';
-
-  if (
-    !chatId ||
-    !data.startsWith('voice:')
-  ) {
+  if (!chatId || !data.startsWith('voice:')) {
     return;
   }
 
   if (!isTelegramChatAllowed(chatId)) {
-    await answerCallbackQuery(
-      callbackQuery.id,
-      'Não autorizado'
-    );
-
+    await answerCallbackQuery(callbackQuery.id, 'Não autorizado');
     return;
   }
 
-  const token =
-    data.slice('voice:'.length);
-
-  const voice =
-    callbackVoices.get(token);
+  const token = data.slice('voice:'.length);
+  const voice = callbackVoices.get(token);
 
   if (!voice) {
     await answerCallbackQuery(
       callbackQuery.id,
       'Este botão expirou. Use /vozes novamente.'
     );
-
     return;
   }
 
-  const chatState =
-    getChatState(chatId);
-
-  chatState.voiceId =
-    voice.voiceId ||
-    voice.name;
-
+  const chatState = getChatState(chatId);
+  chatState.voiceId = voice.voiceId || voice.name;
   await saveState();
 
   await answerCallbackQuery(
@@ -2251,7 +1812,9 @@ async function handleTelegramCallback(
 
   await sendTelegramMessage(
     chatId,
-    `✅ Voz selecionada: ${voice.displayName || chatState.voiceId}\nID: ${chatState.voiceId}`
+    `✅ Voz selecionada: ${
+      voice.displayName || chatState.voiceId
+    }\nID: ${chatState.voiceId}`
   );
 }
 
@@ -2268,42 +1831,23 @@ async function configureTelegramBot() {
     'setMyCommands',
     {
       commands: [
-        {
-          command: 'start',
-          description: 'Abrir o menu',
-        },
+        { command: 'start', description: 'Abrir o menu' },
         {
           command: 'clonar',
           description: 'Clonar voz com amostra de 5-15s',
         },
-        {
-          command: 'vozes',
-          description: 'Escolher uma voz',
-        },
-        {
-          command: 'voz',
-          description: 'Definir voz por ID',
-        },
-        {
-          command: 'preview',
-          description: 'Ouvir a voz atual',
-        },
-        {
-          command: 'teste',
-          description: 'Gerar áudio de teste',
-        },
-        {
-          command: 'modo',
-          description: 'MP3 ou mensagem de voz',
-        },
-        {
-          command: 'status',
-          description: 'Mostrar configuração',
-        },
+        { command: 'vozes', description: 'Escolher uma voz' },
+        { command: 'voz', description: 'Definir voz por ID' },
+        { command: 'preview', description: 'Ouvir a voz atual' },
+        { command: 'teste', description: 'Gerar áudio de teste' },
+        { command: 'modelo', description: 'Trocar modelo da Inworld' },
+        { command: 'modo', description: 'MP3 ou mensagem de voz' },
+        { command: 'status', description: 'Mostrar configuração' },
         {
           command: 'cancelar',
           description: 'Cancelar clonagem pendente',
         },
+        { command: 'ajuda', description: 'Mostrar ajuda' },
       ],
     },
     15000
@@ -2312,65 +1856,55 @@ async function configureTelegramBot() {
 
 async function telegramLoop() {
   if (!TELEGRAM_BOT_TOKEN) {
-    console.log(
-      '[telegram] desativado: TELEGRAM_BOT_TOKEN ausente'
-    );
-
+    console.log('[telegram] desativado: TELEGRAM_BOT_TOKEN ausente');
     return;
   }
 
   try {
     await configureTelegramBot();
+    telegramRuntime.configured = true;
+    telegramRuntime.lastError = null;
     console.log('[telegram] bot configurado');
   } catch (error) {
+    telegramRuntime.lastError = safeError(error);
     console.error(
       '[telegram] falha na configuração:',
-      safeError(error)
+      telegramRuntime.lastError
     );
   }
 
   let offset = 0;
+  telegramRuntime.polling = true;
 
   while (true) {
     try {
-      const updates =
-        await telegramJson(
-          'getUpdates',
-          {
-            offset,
-            timeout: 25,
-            allowed_updates: [
-              'message',
-              'callback_query',
-            ],
-          },
-          35000
-        );
+      const updates = await telegramJson(
+        'getUpdates',
+        {
+          offset,
+          timeout: 25,
+          allowed_updates: ['message', 'callback_query'],
+        },
+        35000
+      );
+
+      telegramRuntime.lastError = null;
 
       for (const update of updates) {
-        offset = Math.max(
-          offset,
-          update.update_id + 1
-        );
+        offset = Math.max(offset, update.update_id + 1);
+        telegramRuntime.lastUpdateAt = Date.now();
 
         if (update.message) {
-          await handleTelegramMessage(
-            update.message
-          );
+          await handleTelegramMessage(update.message);
         }
 
         if (update.callback_query) {
-          await handleTelegramCallback(
-            update.callback_query
-          );
+          await handleTelegramCallback(update.callback_query);
         }
       }
     } catch (error) {
-      console.error(
-        '[telegram loop]',
-        safeError(error)
-      );
-
+      telegramRuntime.lastError = safeError(error);
+      console.error('[telegram loop]', telegramRuntime.lastError);
       await sleep(3000);
     }
   }
@@ -2380,130 +1914,114 @@ async function telegramLoop() {
 // SERVIDOR
 // ============================================================
 
-const server = http.createServer(
-  async (req, res) => {
-    const url = new URL(
-      req.url,
-      `http://${req.headers.host || 'localhost'}`
-    );
+async function handleHttpRequest(req, res) {
+  const url = new URL(
+    req.url || '/',
+    `http://${req.headers.host || 'localhost'}`
+  );
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, CORS);
-      res.end();
-      return;
-    }
-
-    if (
-      req.method === 'GET' &&
-      url.pathname === '/health'
-    ) {
-      sendJson(
-        res,
-        200,
-        {
-          ok: true,
-          service: 'tts.ghost1',
-          model: MODEL_ID,
-          port: PORT,
-          telegram: {
-            enabled:
-              Boolean(TELEGRAM_BOT_TOKEN),
-            sendMode:
-              TELEGRAM_SEND_MODE,
-            generationAudioLimitSeconds:
-              null,
-          },
-          cloning: {
-            enabled: true,
-            minSampleSeconds:
-              CLONE_MIN_SECONDS,
-            maxSampleSeconds:
-              CLONE_MAX_SECONDS,
-          },
-          timestamp: Date.now(),
-        }
-      );
-
-      return;
-    }
-
-    if (
-      req.method === 'GET' &&
-      url.pathname === '/vozes'
-    ) {
-      await handleVoices(
-        req,
-        res,
-        url
-      );
-
-      return;
-    }
-
-    if (
-      req.method === 'GET' &&
-      url.pathname === '/preview'
-    ) {
-      await handlePreview(
-        req,
-        res,
-        url
-      );
-
-      return;
-    }
-
-    if (
-      req.method === 'POST' &&
-      url.pathname === '/clone'
-    ) {
-      await handleClone(
-        req,
-        res
-      );
-
-      return;
-    }
-
-    if (
-      req.method === 'POST' &&
-      (
-        url.pathname === '/' ||
-        url.pathname === '/tts'
-      )
-    ) {
-      await handleSynthesize(
-        req,
-        res
-      );
-
-      return;
-    }
-
-    sendError(
-      res,
-      404,
-      'Rota não encontrada'
-    );
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, CORS);
+    res.end();
+    return;
   }
-);
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    sendJson(res, 200, {
+      ok: true,
+      service: 'tts.ghost1',
+      model: MODEL_ID,
+      port: PORT,
+      uptimeSeconds: Math.floor(process.uptime()),
+      telegram: {
+        enabled: telegramRuntime.enabled,
+        configured: telegramRuntime.configured,
+        polling: telegramRuntime.polling,
+        lastUpdateAt: telegramRuntime.lastUpdateAt,
+        lastError: telegramRuntime.lastError,
+        sendMode: TELEGRAM_SEND_MODE,
+        generationAudioLimitSeconds: null,
+      },
+      cloning: {
+        enabled: true,
+        minSampleSeconds: CLONE_MIN_SECONDS,
+        maxSampleSeconds: CLONE_MAX_SECONDS,
+      },
+      timestamp: Date.now(),
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/vozes') {
+    await handleVoices(req, res, url);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/preview') {
+    await handlePreview(req, res, url);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/clone') {
+    await handleClone(req, res);
+    return;
+  }
+
+  if (
+    req.method === 'POST' &&
+    (url.pathname === '/' || url.pathname === '/tts')
+  ) {
+    await handleSynthesize(req, res);
+    return;
+  }
+
+  sendError(res, 404, 'Rota não encontrada');
+}
+
+const server = http.createServer((req, res) => {
+  void handleHttpRequest(req, res).catch(error => {
+    console.error('[http]', safeError(error));
+
+    if (!res.headersSent) {
+      sendError(res, 500, 'Erro interno do servidor', safeError(error));
+      return;
+    }
+
+    res.destroy(error);
+  });
+});
+
+server.on('clientError', (error, socket) => {
+  console.error('[http client]', safeError(error));
+
+  if (socket.writable) {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  }
+});
 
 await loadState();
 
-server.listen(
-  PORT,
-  '0.0.0.0',
-  () => {
-    console.log(
-      `tts.ghost1 ativo em http://0.0.0.0:${PORT}`
-    );
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`tts.ghost1 ativo em http://0.0.0.0:${PORT}`);
+  console.log('POST / ou /tts -> gera áudio');
+  console.log('POST /clone -> clona voz');
+  console.log('GET /vozes -> lista vozes');
+  console.log('GET /preview -> preview');
+  console.log('GET /health -> diagnóstico');
 
-    console.log('POST / ou /tts -> gera áudio');
-    console.log('POST /clone -> clona voz');
-    console.log('GET /vozes -> lista vozes');
-    console.log('GET /preview -> preview');
-    console.log('GET /health -> diagnóstico');
+  void telegramLoop();
+});
 
-    void telegramLoop();
-  }
-);
+function shutdown(signal) {
+  console.log(`[server] encerrando por ${signal}`);
+
+  server.close(error => {
+    if (error) {
+      console.error('[server] falha ao encerrar:', safeError(error));
+      process.exitCode = 1;
+    }
+  });
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
