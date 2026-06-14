@@ -1,9 +1,9 @@
 {
   "name": "tts.ghost1",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
-  "description": "Proxy compatível para a API oficial de TTS da Inworld",
+  "description": "API oficial Inworld TTS com clonagem de voz e bot Telegram",
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js"

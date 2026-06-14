@@ -2,10 +2,13 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-COPY package.json server.js ./
+RUN apk add --no-cache ffmpeg \
+    && addgroup -S tts \
+    && adduser -S tts -G tts \
+    && mkdir -p /app/data \
+    && chown -R tts:tts /app
 
-RUN addgroup -S tts \
-    && adduser -S tts -G tts
+COPY --chown=tts:tts package.json server.js ./
 
 USER tts
 

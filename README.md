@@ -1,133 +1,137 @@
-# tts.ghost1
+# tts.ghost1 — clonagem correta
 
-Serviço HTTP compatível com a API anterior do projeto, mas usando diretamente a API oficial atual da Inworld.
+API HTTP + bot Telegram usando a API oficial da Inworld.
 
-## Compatibilidade mantida
+## Regra correta dos 15 segundos
 
-- Porta `7979`
-- `POST /`
-- `POST /tts`
-- `GET /vozes`
-- `GET /preview`
-- `GET /health`
-- Campos antigos: `chavesecreta`, `voz`, `texto` e `model`
-- Resposta da síntese como áudio binário
+Os **5–15 segundos são somente para a amostra usada para clonar a voz**.
 
-## Mudança principal
-
-A autenticação antiga via Firebase e token do portal foi removida.
-
-Agora o serviço utiliza:
-
-```http
-Authorization: Basic INWORLD_API_KEY
-```
-
-na API oficial:
+Fluxo:
 
 ```text
-https://api.inworld.ai/tts/v1/voice
+amostra de voz de 5–15s
+        ↓
+Inworld cria um voiceId
+        ↓
+esse voiceId pode gerar novos áudios normalmente
 ```
 
-## Configuração
+Os áudios gerados pelo TTS **não são cortados em 15 segundos**.
 
-Copie o exemplo:
+Quando o texto do Telegram ultrapassa o limite de uma chamada da Inworld, o programa divide o texto em partes, gera todas e reúne em um único MP3.
 
-```bash
-cp .env.example .env
+## Telegram
+
+### Clonar uma voz
+
+Envie:
+
+```text
+/clonar Minha Voz | PT_BR | Olá, esta é uma amostra da minha voz.
 ```
 
-Edite `.env`:
+Depois envie uma mensagem de voz, MP3, WAV, OGG ou outro arquivo de áudio.
+
+O bot:
+
+1. baixa a amostra;
+2. verifica se tem pelo menos 5 segundos;
+3. corta somente a amostra se passar de 15 segundos;
+4. converte para WAV mono, 24 kHz e PCM 16-bit;
+5. chama `POST https://api.inworld.ai/voices/v1/voices:clone`;
+6. recebe o novo `voiceId`;
+7. seleciona automaticamente a voz clonada;
+8. usa essa voz para os próximos textos.
+
+Use apenas áudio que você tenha autorização para clonar.
+
+### Gerar áudio
+
+Depois da clonagem, envie qualquer texto:
+
+```text
+Este texto será falado com a voz que acabei de clonar.
+```
+
+O áudio gerado não recebe corte de 15 segundos.
+
+### Comandos
+
+```text
+/start
+/clonar Nome | PT_BR | transcrição opcional
+/cancelar
+/vozes pt
+/voz ID
+/preview
+/teste
+/modelo inworld-tts-2
+/modo audio
+/modo voz
+/status
+```
+
+## API HTTP mantida
+
+```text
+POST /        gerar áudio
+POST /tts     gerar áudio
+POST /clone   clonar voz
+GET /vozes    listar vozes
+GET /preview  obter preview
+GET /health   diagnóstico
+```
+
+## Variáveis no Coolify
 
 ```env
-SECRET_KEY=uma_senha_para_proteger_seu_proxy
-INWORLD_API_KEY=sua_chave_oficial_da_inworld
+SECRET_KEY=SUA_SENHA
+INWORLD_API_KEY=SUA_CHAVE_OFICIAL
 MODEL_ID=inworld-tts-2
-AUDIO_ENCODING=MP3
-SAMPLE_RATE_HERTZ=48000
-DELIVERY_MODE=BALANCED
-TEXT_NORMALIZATION=ON
 PORT=7979
+
+TELEGRAM_BOT_TOKEN=TOKEN_NOVO_DO_BOTFATHER
+TELEGRAM_ALLOWED_CHAT_IDS=5619062865
+TELEGRAM_DEFAULT_VOICE=Beatriz
+TELEGRAM_DEFAULT_LANGUAGE=PT_BR
+TELEGRAM_SEND_MODE=audio
+TELEGRAM_MAX_TEXT_CHARS=4096
+
+CLONE_MIN_SECONDS=5
+CLONE_MAX_SECONDS=15
+CLONE_SAMPLE_RATE_HERTZ=24000
+CLONE_REMOVE_BACKGROUND_NOISE=true
 ```
 
-A variável `INWORLD_API_KEY` pode ser informada apenas como a chave ou já começando com `Basic `.
+A chave oficial da Inworld precisa ter permissão de escrita para a clonagem.
 
-## Rodar com Docker
+## Docker
 
 ```bash
 docker compose up -d --build
 ```
 
-Ver logs:
+Logs:
 
 ```bash
 docker logs -f tts-ghost1
 ```
 
-Testar saúde:
+Health:
 
 ```bash
-curl http://localhost:7979/health
+curl http://127.0.0.1:7979/health
 ```
 
-## Gerar áudio
+## Coolify e Cloudflare
 
-```bash
-curl -X POST http://localhost:7979/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "chavesecreta": "sua_senha",
-    "voz": "Dennis",
-    "texto": "Olá, este é um teste.",
-    "model": "inworld-tts-2"
-  }' \
-  --output teste.mp3
-```
-
-Também aceita os nomes oficiais:
-
-```json
-{
-  "text": "Olá",
-  "voiceId": "Dennis",
-  "modelId": "inworld-tts-2"
-}
-```
-
-## Listar vozes
-
-```bash
-curl http://localhost:7979/vozes \
-  -H "x-secret: sua_senha"
-```
-
-O serviço usa a nova Voices API:
+O Compose publica:
 
 ```text
-GET https://api.inworld.ai/voices/v1/voices
+7979:7979
 ```
 
-## Preview de uma voz
-
-```bash
-curl "http://localhost:7979/preview?voiceId=Dennis" \
-  -H "x-secret: sua_senha" \
-  --output preview.mp3
-```
-
-## Health check
-
-```bash
-curl http://localhost:7979/health
-```
-
-## Coolify
-
-Use o repositório como recurso Docker Compose.
-
-Configure as variáveis de ambiente no Coolify e mantenha a porta `7979`.
-
-Para Cloudflare Tunnel:
+Rota do Cloudflare:
 
 ```text
 apitts.ghost1.cloud -> http://localhost:7979
@@ -135,6 +139,6 @@ apitts.ghost1.cloud -> http://localhost:7979
 
 ## Segurança
 
-Nunca envie o arquivo `.env` ao GitHub.
+Não envie `.env` ao GitHub.
 
-Use uma `SECRET_KEY` forte para impedir uso público não autorizado do proxy.
+Regere tokens que já tenham sido publicados em conversas ou logs.
