@@ -142,6 +142,10 @@ const DELIVERY_MODE = stringEnv('DELIVERY_MODE', 'BALANCED');
 const TEXT_NORMALIZATION = stringEnv('TEXT_NORMALIZATION', 'ON');
 const INWORLD_TIMEOUT_MS = numberEnv('INWORLD_TIMEOUT_MS', 120000);
 const PROCESS_TIMEOUT_MS = numberEnv('PROCESS_TIMEOUT_MS', 180000);
+const INWORLD_WORKSPACE_ID = stringEnv(
+  'INWORLD_WORKSPACE_ID',
+  'default--pb4bm1oowkem_r9ri2wiw'
+);
 
 const TELEGRAM_BOT_TOKEN = stringEnv('TELEGRAM_BOT_TOKEN');
 const TELEGRAM_ALLOWED_CHAT_IDS = new Set(
@@ -223,6 +227,7 @@ const CORS = {
 
 const state = {
   chats: {},
+  clonedVoices: [],
 };
 
 let saveStateQueue = Promise.resolve();
@@ -252,6 +257,12 @@ async function loadState() {
     if (parsed?.chats && typeof parsed.chats === 'object') {
       state.chats = parsed.chats;
     }
+
+    if (Array.isArray(parsed?.clonedVoices)) {
+      state.clonedVoices = parsed.clonedVoices.filter(
+        voice => voice && typeof voice === 'object' && voice.voiceId
+      );
+    }
   } catch (error) {
     if (error.code !== 'ENOENT') {
       console.error('[state] não foi possível carregar:', safeError(error));
@@ -279,6 +290,10 @@ function getChatState(chatId) {
   if (!state.chats[key]) {
     state.chats[key] = {
       voiceId: TELEGRAM_DEFAULT_VOICE,
+      voiceDisplayName: TELEGRAM_DEFAULT_VOICE,
+      voiceSource: 'SYSTEM',
+      voiceResourceName: '',
+      voiceWorkspaceId: '',
       modelId: MODEL_ID,
       sendMode: TELEGRAM_SEND_MODE,
       language: TELEGRAM_DEFAULT_LANGUAGE,
@@ -286,7 +301,36 @@ function getChatState(chatId) {
     };
   }
 
-  return state.chats[key];
+  const chatState = state.chats[key];
+
+  chatState.voiceId = String(
+    chatState.voiceId ||
+    TELEGRAM_DEFAULT_VOICE
+  ).trim();
+
+  chatState.voiceDisplayName = String(
+    chatState.voiceDisplayName ||
+    chatState.voiceId ||
+    TELEGRAM_DEFAULT_VOICE
+  ).trim();
+
+  chatState.voiceSource = String(
+    chatState.voiceSource ||
+    ''
+  ).trim();
+
+  chatState.voiceResourceName = String(
+    chatState.voiceResourceName ||
+    ''
+  ).trim();
+
+  chatState.voiceWorkspaceId = String(
+    chatState.voiceWorkspaceId ||
+    voiceWorkspaceId(chatState.voiceId) ||
+    ''
+  ).trim();
+
+  return chatState;
 }
 
 function isTelegramChatAllowed(chatId) {
@@ -295,6 +339,472 @@ function isTelegramChatAllowed(chatId) {
   }
 
   return TELEGRAM_ALLOWED_CHAT_IDS.has(String(chatId));
+}
+
+function clearVoicesCache() {
+  voicesCache.expiresAt = 0;
+  voicesCache.byLanguage.clear();
+}
+
+function normalizeVoiceText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .trim();
+}
+
+function normalizeVoiceLookup(value) {
+  let normalized = normalizeVoiceText(value);
+
+  normalized = normalized
+    .replace(/^workspaces\/[^/]+\/voices\//, '');
+
+  if (normalized.includes('__')) {
+    normalized = normalized
+      .split('__')
+      .slice(1)
+      .join('__');
+  }
+
+  return normalized.replace(/[^a-z0-9]+/g, '');
+}
+
+function voiceWorkspaceId(value) {
+  const raw = String(value || '').trim();
+
+  if (raw.startsWith('workspaces/')) {
+    return raw.split('/')[1] || '';
+  }
+
+  const separator = raw.indexOf('__');
+
+  if (separator > 0) {
+    return raw.slice(0, separator);
+  }
+
+  return '';
+}
+
+function voiceShortId(value) {
+  const raw = String(value || '').trim();
+
+  if (!raw) {
+    return '';
+  }
+
+  if (raw.startsWith('workspaces/')) {
+    return raw.split('/voices/')[1] || raw;
+  }
+
+  const separator = raw.indexOf('__');
+
+  if (separator >= 0) {
+    return raw.slice(separator + 2);
+  }
+
+  return raw;
+}
+
+function buildVoiceIdFromResourceName(name) {
+  const raw = String(name || '').trim();
+  const match = raw.match(
+    /^workspaces\/([^/]+)\/voices\/(.+)$/
+  );
+
+  if (!match) {
+    return '';
+  }
+
+  return `${match[1]}__${match[2]}`;
+}
+
+function normalizeVoiceRecord(voice) {
+  if (!voice || typeof voice !== 'object') {
+    return null;
+  }
+
+  const resourceName = String(
+    voice.name ||
+    voice.resourceName ||
+    ''
+  ).trim();
+
+  const voiceId = String(
+    voice.voiceId ||
+    voice.voice_id ||
+    buildVoiceIdFromResourceName(resourceName) ||
+    ''
+  ).trim();
+
+  if (!voiceId) {
+    return null;
+  }
+
+  const shortId = voiceShortId(voiceId);
+  const displayName = String(
+    voice.displayName ||
+    voice.display_name ||
+    voice.title ||
+    shortId ||
+    voiceId
+  ).trim();
+
+  const rawLangCode =
+    voice.langCode ||
+    voice.lang_code ||
+    voice.language ||
+    voice.languages?.[0] ||
+    '';
+
+  const langCode = rawLangCode
+    ? normalizeLanguage(rawLangCode)
+    : '';
+
+  const source = String(
+    voice.source ||
+    (voiceId.includes('__') ? 'IVC' : 'SYSTEM')
+  )
+    .trim()
+    .toUpperCase();
+
+  return {
+    ...voice,
+    voiceId,
+    name: resourceName || voice.name || voiceId,
+    displayName,
+    langCode,
+    source,
+    workspaceId:
+      voice.workspaceId ||
+      voiceWorkspaceId(voiceId) ||
+      voiceWorkspaceId(resourceName),
+    shortId,
+  };
+}
+
+function voiceKey(voice) {
+  const normalized = normalizeVoiceRecord(voice);
+
+  return String(
+    normalized?.voiceId ||
+    normalized?.name ||
+    normalized?.displayName ||
+    ''
+  ).trim();
+}
+
+function isCustomVoice(voice) {
+  const normalized = normalizeVoiceRecord(voice);
+
+  if (!normalized) {
+    return false;
+  }
+
+  const source = String(normalized.source || '').toUpperCase();
+  const tags = Array.isArray(normalized.tags)
+    ? normalized.tags.map(tag => String(tag).toLowerCase())
+    : [];
+
+  return (
+    normalized.isCustom === true ||
+    normalized.voiceId.includes('__') ||
+    ['IVC', 'PVC', 'CUSTOM', 'DESIGNED', 'VOICE_DESIGN'].includes(source) ||
+    tags.includes('clone') ||
+    tags.includes('cloned') ||
+    tags.includes('ghost1') ||
+    tags.includes('custom')
+  );
+}
+
+function voiceMatchesLanguage(voice, language) {
+  if (!language) {
+    return true;
+  }
+
+  const normalized = normalizeVoiceRecord(voice);
+
+  if (!normalized) {
+    return false;
+  }
+
+  if (
+    !normalized.langCode ||
+    normalized.langCode === 'AUTO'
+  ) {
+    return true;
+  }
+
+  return normalized.langCode === normalizeLanguage(language);
+}
+
+function voiceLabel(voice) {
+  const normalized = normalizeVoiceRecord(voice);
+
+  if (!normalized) {
+    return 'Voz';
+  }
+
+  return normalized.displayName ||
+    normalized.shortId ||
+    normalized.voiceId;
+}
+
+function voiceWorkspaceLabel(voice) {
+  const normalized = normalizeVoiceRecord(voice);
+
+  return normalized?.workspaceId || '';
+}
+
+function voiceSearchValues(voice) {
+  const normalized = normalizeVoiceRecord(voice);
+
+  if (!normalized) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      [
+        normalized.displayName,
+        normalized.voiceId,
+        normalized.name,
+        normalized.shortId,
+        normalized.voiceId.replace(
+          `${normalized.workspaceId}__`,
+          ''
+        ),
+      ]
+        .map(value => String(value || '').trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function voiceMatchScore(voice, query) {
+  const normalizedQuery = normalizeVoiceLookup(query);
+
+  if (!normalizedQuery) {
+    return 0;
+  }
+
+  const normalized = normalizeVoiceRecord(voice);
+
+  if (!normalized) {
+    return 0;
+  }
+
+  const rawQuery = normalizeVoiceText(query);
+  const exactRawValues = voiceSearchValues(normalized)
+    .map(normalizeVoiceText);
+
+  if (exactRawValues.includes(rawQuery)) {
+    return 1000;
+  }
+
+  const candidates = voiceSearchValues(normalized)
+    .map(normalizeVoiceLookup)
+    .filter(Boolean);
+
+  if (candidates.includes(normalizedQuery)) {
+    return isCustomVoice(normalized) ? 980 : 960;
+  }
+
+  const displayName = normalizeVoiceLookup(
+    normalized.displayName
+  );
+
+  if (
+    displayName.startsWith(normalizedQuery) ||
+    normalizedQuery.startsWith(displayName)
+  ) {
+    return isCustomVoice(normalized) ? 820 : 780;
+  }
+
+  const shortId = normalizeVoiceLookup(
+    normalized.shortId
+  );
+
+  if (
+    shortId.startsWith(normalizedQuery) ||
+    normalizedQuery.startsWith(shortId)
+  ) {
+    return isCustomVoice(normalized) ? 760 : 720;
+  }
+
+  if (
+    displayName.includes(normalizedQuery) ||
+    normalizedQuery.includes(displayName)
+  ) {
+    return isCustomVoice(normalized) ? 680 : 640;
+  }
+
+  if (
+    shortId.includes(normalizedQuery) ||
+    normalizedQuery.includes(shortId)
+  ) {
+    return isCustomVoice(normalized) ? 620 : 580;
+  }
+
+  return 0;
+}
+
+function mergeAndSortVoices(...voiceLists) {
+  const voicesByKey = new Map();
+
+  for (const list of voiceLists) {
+    for (const rawVoice of Array.isArray(list) ? list : []) {
+      const voice = normalizeVoiceRecord(rawVoice);
+      const key = voiceKey(voice);
+
+      if (!voice || !key) {
+        continue;
+      }
+
+      const previous = voicesByKey.get(key) || {};
+
+      voicesByKey.set(
+        key,
+        normalizeVoiceRecord({
+          ...previous,
+          ...voice,
+        })
+      );
+    }
+  }
+
+  return [...voicesByKey.values()]
+    .filter(Boolean)
+    .sort((a, b) => {
+      const customDifference =
+        Number(isCustomVoice(b)) -
+        Number(isCustomVoice(a));
+
+      if (customDifference !== 0) {
+        return customDifference;
+      }
+
+      return voiceLabel(a).localeCompare(
+        voiceLabel(b),
+        'pt-BR',
+        { sensitivity: 'base' }
+      );
+    });
+}
+
+function rememberClonedVoice(voice) {
+  const normalized = normalizeVoiceRecord(voice);
+  const key = voiceKey(normalized);
+
+  if (!normalized || !key) {
+    return false;
+  }
+
+  const before = JSON.stringify(state.clonedVoices);
+
+  state.clonedVoices = mergeAndSortVoices(
+    state.clonedVoices,
+    [{
+      ...normalized,
+      isCustom: true,
+      source: normalized.source || 'IVC',
+      tags: Array.from(
+        new Set([
+          ...(Array.isArray(normalized.tags)
+            ? normalized.tags
+            : []),
+          'ghost1',
+          'clone',
+        ])
+      ),
+    }]
+  ).filter(isCustomVoice);
+
+  return before !== JSON.stringify(state.clonedVoices);
+}
+
+function applyVoiceToChatState(chatState, voice) {
+  const normalized = normalizeVoiceRecord(voice);
+
+  if (!normalized) {
+    throw new Error(
+      'A voz selecionada não possui um voiceId válido.'
+    );
+  }
+
+  const before = JSON.stringify({
+    voiceId: chatState.voiceId,
+    voiceDisplayName: chatState.voiceDisplayName,
+    voiceSource: chatState.voiceSource,
+    voiceResourceName: chatState.voiceResourceName,
+    voiceWorkspaceId: chatState.voiceWorkspaceId,
+    language: chatState.language,
+  });
+
+  chatState.voiceId = normalized.voiceId;
+  chatState.voiceDisplayName = normalized.displayName;
+  chatState.voiceSource = normalized.source;
+  chatState.voiceResourceName = normalized.name || '';
+  chatState.voiceWorkspaceId = normalized.workspaceId || '';
+
+  if (
+    normalized.langCode &&
+    normalized.langCode !== 'AUTO'
+  ) {
+    chatState.language = normalized.langCode;
+  }
+
+  const after = JSON.stringify({
+    voiceId: chatState.voiceId,
+    voiceDisplayName: chatState.voiceDisplayName,
+    voiceSource: chatState.voiceSource,
+    voiceResourceName: chatState.voiceResourceName,
+    voiceWorkspaceId: chatState.voiceWorkspaceId,
+    language: chatState.language,
+  });
+
+  return before !== after;
+}
+
+function voiceCandidateSummary(voice) {
+  const normalized = normalizeVoiceRecord(voice);
+
+  if (!normalized) {
+    return null;
+  }
+
+  return {
+    displayName: normalized.displayName,
+    voiceId: normalized.voiceId,
+    shortId: normalized.shortId,
+    workspaceId: normalized.workspaceId,
+    source: normalized.source,
+    langCode: normalized.langCode,
+  };
+}
+
+function isUnknownVoiceError(error) {
+  return safeError(error)
+    .toLowerCase()
+    .includes('unknown voice');
+}
+
+function createVoiceNotFoundError(query, extra = '') {
+  const error = new Error(
+    [
+      `A voz "${query}" não foi encontrada na conta atual da Inworld.`,
+      INWORLD_WORKSPACE_ID
+        ? `Workspace configurado: ${INWORLD_WORKSPACE_ID}.`
+        : '',
+      'Use /vozes para selecionar uma voz válida.',
+      extra,
+    ]
+      .filter(Boolean)
+      .join(' ')
+  );
+
+  error.code = 'VOICE_NOT_FOUND';
+  return error;
 }
 
 // ============================================================
@@ -593,30 +1103,450 @@ async function synthesizeLongSpeech({ text, voiceId, modelId }) {
   };
 }
 
-async function listVoices(language) {
-  const normalizedLanguage = normalizeLanguage(language);
+async function listVoices(
+  language,
+  { refresh = false } = {}
+) {
+  const normalizedLanguage = language
+    ? normalizeLanguage(language)
+    : '';
+  const cacheKey = normalizedLanguage || '__ALL__';
   const now = Date.now();
-  const cached = voicesCache.byLanguage.get(normalizedLanguage);
+  const cached = voicesCache.byLanguage.get(cacheKey);
 
-  if (cached && voicesCache.expiresAt > now) {
+  if (
+    !refresh &&
+    cached &&
+    voicesCache.expiresAt > now
+  ) {
     return cached;
   }
 
-  const url = new URL('https://api.inworld.ai/voices/v1/voices');
-  url.searchParams.append('languages', normalizedLanguage);
+  const url = new URL(
+    'https://api.inworld.ai/voices/v1/voices'
+  );
+
+  if (normalizedLanguage) {
+    url.searchParams.append(
+      'languages',
+      normalizedLanguage
+    );
+  }
 
   const result = await inworldRequest(url.toString());
-  const voices = Array.isArray(result.voices) ? result.voices : [];
+  const remoteVoices = Array.isArray(result.voices)
+    ? result.voices
+    : [];
 
-  if (voicesCache.expiresAt <= now) {
+  // A resposta atual da API é a fonte de verdade.
+  // Vozes salvas localmente não são recolocadas na lista
+  // quando desapareceram do workspace, evitando IDs mortos.
+  const voices = mergeAndSortVoices(
+    remoteVoices
+  );
+
+  let stateChanged = false;
+
+  for (
+    const voice of remoteVoices.filter(isCustomVoice)
+  ) {
+    stateChanged =
+      rememberClonedVoice(voice) ||
+      stateChanged;
+  }
+
+  if (stateChanged) {
+    await saveState();
+  }
+
+  if (
+    refresh ||
+    voicesCache.expiresAt <= now
+  ) {
     voicesCache = {
-      expiresAt: now + 10 * 60 * 1000,
+      expiresAt:
+        now + 10 * 60 * 1000,
       byLanguage: new Map(),
     };
   }
 
-  voicesCache.byLanguage.set(normalizedLanguage, voices);
+  voicesCache.byLanguage.set(cacheKey, voices);
   return voices;
+}
+
+async function listSelectableVoices(
+  language,
+  { refresh = false } = {}
+) {
+  const normalizedLanguage = language
+    ? normalizeLanguage(language)
+    : '';
+
+  const filteredVoices = await listVoices(
+    normalizedLanguage,
+    { refresh }
+  );
+
+  if (!normalizedLanguage) {
+    return filteredVoices;
+  }
+
+  const allVoices = await listVoices(
+    '',
+    { refresh }
+  );
+
+  const allCustomVoices = allVoices.filter(
+    voice =>
+      isCustomVoice(voice) &&
+      (
+        voiceMatchesLanguage(
+          voice,
+          normalizedLanguage
+        ) ||
+        !voice.langCode ||
+        voice.langCode === 'AUTO'
+      )
+  );
+
+  return mergeAndSortVoices(
+    allCustomVoices,
+    filteredVoices
+  );
+}
+
+async function getVoiceById(voiceId) {
+  const normalizedId = String(
+    voiceId ||
+    ''
+  ).trim();
+
+  if (!normalizedId) {
+    return null;
+  }
+
+  const url =
+    `https://api.inworld.ai/voices/v1/voices/` +
+    encodeURIComponent(normalizedId);
+
+  try {
+    const result = await inworldRequest(url);
+    const voice = normalizeVoiceRecord(
+      result.voice ||
+      result.result ||
+      result
+    );
+
+    if (
+      voice &&
+      isCustomVoice(voice)
+    ) {
+      const changed = rememberClonedVoice(voice);
+
+      if (changed) {
+        await saveState();
+      }
+    }
+
+    return voice;
+  } catch (error) {
+    if (
+      error.status === 400 ||
+      error.status === 404
+    ) {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+function forgetClonedVoice(voiceId) {
+  const normalizedId = String(
+    voiceId ||
+    ''
+  ).trim();
+
+  if (!normalizedId) {
+    return false;
+  }
+
+  const before = state.clonedVoices.length;
+
+  state.clonedVoices = state.clonedVoices.filter(
+    voice =>
+      normalizeVoiceRecord(voice)?.voiceId !==
+      normalizedId
+  );
+
+  return state.clonedVoices.length !== before;
+}
+
+async function resolveVoiceReference(
+  query,
+  language,
+  {
+    refresh = false,
+    excludeVoiceIds = [],
+  } = {}
+) {
+  const rawQuery = String(
+    query ||
+    ''
+  ).trim();
+
+  if (!rawQuery) {
+    return {
+      status: 'not_found',
+      query: rawQuery,
+      matches: [],
+    };
+  }
+
+  if (refresh) {
+    clearVoicesCache();
+  }
+
+  const excluded = new Set(
+    excludeVoiceIds
+      .map(value => String(value || '').trim())
+      .filter(Boolean)
+  );
+
+  const voices = (
+    await listSelectableVoices(
+      language,
+      { refresh }
+    )
+  ).filter(
+    voice =>
+      !excluded.has(
+        normalizeVoiceRecord(voice)?.voiceId
+      )
+  );
+
+  const ranked = voices
+    .map(voice => ({
+      voice: normalizeVoiceRecord(voice),
+      score: voiceMatchScore(voice, rawQuery),
+    }))
+    .filter(
+      item =>
+        item.voice &&
+        item.score > 0
+    )
+    .sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+
+      const customDifference =
+        Number(isCustomVoice(b.voice)) -
+        Number(isCustomVoice(a.voice));
+
+      if (customDifference !== 0) {
+        return customDifference;
+      }
+
+      return voiceLabel(a.voice).localeCompare(
+        voiceLabel(b.voice),
+        'pt-BR',
+        { sensitivity: 'base' }
+      );
+    });
+
+  if (ranked.length > 0) {
+    const best = ranked[0];
+    const tiedBest = ranked.filter(
+      item => item.score === best.score
+    );
+
+    if (
+      tiedBest.length === 1 &&
+      best.score >= 620
+    ) {
+      return {
+        status: 'found',
+        query: rawQuery,
+        voice: best.voice,
+        matches: ranked
+          .slice(0, 10)
+          .map(item => item.voice),
+      };
+    }
+
+    return {
+      status: 'ambiguous',
+      query: rawQuery,
+      matches: tiedBest
+        .slice(0, 10)
+        .map(item => item.voice),
+    };
+  }
+
+  const directCandidates = [];
+
+  if (
+    rawQuery.startsWith('workspaces/')
+  ) {
+    directCandidates.push(
+      buildVoiceIdFromResourceName(rawQuery)
+    );
+  }
+
+  if (rawQuery.includes('__')) {
+    directCandidates.push(rawQuery);
+  } else if (INWORLD_WORKSPACE_ID) {
+    const shortId = voiceShortId(rawQuery)
+      .trim()
+      .replace(/\s+/g, '-');
+
+    if (shortId) {
+      directCandidates.push(
+        `${INWORLD_WORKSPACE_ID}__${shortId}`
+      );
+    }
+  }
+
+  for (
+    const candidate of Array.from(
+      new Set(
+        directCandidates.filter(Boolean)
+      )
+    )
+  ) {
+    if (excluded.has(candidate)) {
+      continue;
+    }
+
+    const voice = await getVoiceById(candidate);
+
+    if (voice) {
+      return {
+        status: 'found',
+        query: rawQuery,
+        voice,
+        matches: [voice],
+      };
+    }
+  }
+
+  return {
+    status: 'not_found',
+    query: rawQuery,
+    matches: [],
+  };
+}
+
+async function resolveChatVoice(
+  chatState,
+  {
+    refresh = false,
+    excludeVoiceIds = [],
+  } = {}
+) {
+  const queries = Array.from(
+    new Set(
+      [
+        chatState.voiceId,
+        chatState.voiceDisplayName,
+      ]
+        .map(value => String(value || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  let ambiguousResult = null;
+
+  for (const query of queries) {
+    const result = await resolveVoiceReference(
+      query,
+      chatState.language,
+      {
+        refresh,
+        excludeVoiceIds,
+      }
+    );
+
+    if (result.status === 'found') {
+      const changed = applyVoiceToChatState(
+        chatState,
+        result.voice
+      );
+
+      if (changed) {
+        await saveState();
+      }
+
+      return result.voice;
+    }
+
+    if (
+      result.status === 'ambiguous' &&
+      !ambiguousResult
+    ) {
+      ambiguousResult = result;
+    }
+  }
+
+  if (ambiguousResult) {
+    const error = new Error(
+      `O nome "${ambiguousResult.query}" corresponde a mais de uma voz. Use /vozes e toque na voz correta.`
+    );
+
+    error.code = 'VOICE_AMBIGUOUS';
+    error.matches = ambiguousResult.matches;
+    throw error;
+  }
+
+  throw createVoiceNotFoundError(
+    chatState.voiceDisplayName ||
+    chatState.voiceId
+  );
+}
+
+async function recoverChatVoiceAfterUnknown(
+  chatState
+) {
+  const invalidVoiceId = chatState.voiceId;
+  const displayName =
+    chatState.voiceDisplayName ||
+    voiceShortId(invalidVoiceId) ||
+    invalidVoiceId;
+
+  const removed = forgetClonedVoice(
+    invalidVoiceId
+  );
+
+  clearVoicesCache();
+
+  const result = await resolveVoiceReference(
+    displayName,
+    chatState.language,
+    {
+      refresh: true,
+      excludeVoiceIds: [invalidVoiceId],
+    }
+  );
+
+  if (result.status === 'found') {
+    applyVoiceToChatState(
+      chatState,
+      result.voice
+    );
+
+    await saveState();
+    return result.voice;
+  }
+
+  if (removed) {
+    await saveState();
+  }
+
+  throw createVoiceNotFoundError(
+    displayName,
+    `O ID antigo era "${invalidVoiceId}" e foi removido do estado salvo.`
+  );
 }
 
 async function getVoicePreview(voiceId, modelId) {
@@ -676,6 +1606,9 @@ async function cloneVoice({
   if (!voice?.voiceId) {
     throw new Error('A Inworld não retornou o voiceId da voz clonada');
   }
+
+  rememberClonedVoice(voice);
+  await saveState();
 
   voicesCache.expiresAt = 0;
   voicesCache.byLanguage.clear();
@@ -962,18 +1895,98 @@ async function handleSynthesize(req, res) {
   }
 
   try {
-    const result = await synthesizeSpeech({
-      text,
+    const resolution = await resolveVoiceReference(
       voiceId,
-      modelId: body.model ?? body.modelId ?? MODEL_ID,
-      audioEncoding: body.audioEncoding ?? AUDIO_ENCODING,
-      sampleRateHertz: body.sampleRateHertz ?? SAMPLE_RATE_HERTZ,
-      deliveryMode: body.deliveryMode ?? DELIVERY_MODE,
-      applyTextNormalization:
-        body.applyTextNormalization ?? TEXT_NORMALIZATION,
-      language: body.language,
-      temperature: body.temperature,
-    });
+      body.language || TELEGRAM_DEFAULT_LANGUAGE
+    );
+
+    if (resolution.status === 'ambiguous') {
+      return sendJson(res, 409, {
+        error: 'Nome de voz ambíguo',
+        message:
+          `Mais de uma voz corresponde a "${voiceId}". Envie o voiceId completo.`,
+        matches: resolution.matches
+          .map(voiceCandidateSummary)
+          .filter(Boolean),
+      });
+    }
+
+    if (resolution.status !== 'found') {
+      return sendJson(res, 404, {
+        error: 'Voz não encontrada',
+        message: createVoiceNotFoundError(
+          voiceId
+        ).message,
+      });
+    }
+
+    let resolvedVoice = resolution.voice;
+    let result;
+
+    try {
+      result = await synthesizeSpeech({
+        text,
+        voiceId: resolvedVoice.voiceId,
+        modelId: body.model ?? body.modelId ?? MODEL_ID,
+        audioEncoding: body.audioEncoding ?? AUDIO_ENCODING,
+        sampleRateHertz: body.sampleRateHertz ?? SAMPLE_RATE_HERTZ,
+        deliveryMode: body.deliveryMode ?? DELIVERY_MODE,
+        applyTextNormalization:
+          body.applyTextNormalization ?? TEXT_NORMALIZATION,
+        language: body.language,
+        temperature: body.temperature,
+      });
+    } catch (error) {
+      if (!isUnknownVoiceError(error)) {
+        throw error;
+      }
+
+      forgetClonedVoice(resolvedVoice.voiceId);
+      clearVoicesCache();
+
+      const refreshed = await resolveVoiceReference(
+        resolvedVoice.displayName || voiceId,
+        body.language || TELEGRAM_DEFAULT_LANGUAGE,
+        {
+          refresh: true,
+          excludeVoiceIds: [resolvedVoice.voiceId],
+        }
+      );
+
+      if (refreshed.status !== 'found') {
+        throw createVoiceNotFoundError(
+          resolvedVoice.displayName || voiceId,
+          `O ID inválido era "${resolvedVoice.voiceId}".`
+        );
+      }
+
+      resolvedVoice = refreshed.voice;
+
+      try {
+        result = await synthesizeSpeech({
+          text,
+          voiceId: resolvedVoice.voiceId,
+          modelId: body.model ?? body.modelId ?? MODEL_ID,
+          audioEncoding: body.audioEncoding ?? AUDIO_ENCODING,
+          sampleRateHertz: body.sampleRateHertz ?? SAMPLE_RATE_HERTZ,
+          deliveryMode: body.deliveryMode ?? DELIVERY_MODE,
+          applyTextNormalization:
+            body.applyTextNormalization ?? TEXT_NORMALIZATION,
+          language: body.language,
+          temperature: body.temperature,
+        });
+      } catch (retryError) {
+        if (isUnknownVoiceError(retryError)) {
+          throw createVoiceNotFoundError(
+            resolvedVoice.displayName ||
+            resolvedVoice.voiceId,
+            `O ID "${resolvedVoice.voiceId}" também foi recusado pela Inworld.`
+          );
+        }
+
+        throw retryError;
+      }
+    }
 
     const contentType = contentTypeForEncoding(result.audioEncoding);
     const extension = extensionForContentType(contentType);
@@ -984,6 +1997,10 @@ async function handleSynthesize(req, res) {
       'Content-Disposition': `inline; filename="audio.${extension}"`,
       'Cache-Control': 'no-store',
       'X-Inworld-Model': result.modelId,
+      'X-Inworld-Voice-Id': resolvedVoice.voiceId,
+      'X-Inworld-Voice-Name': encodeURIComponent(
+        resolvedVoice.displayName
+      ),
       'X-Inworld-Characters': String(
         result.usage?.processedCharactersCount ?? text.length
       ),
@@ -1015,8 +2032,12 @@ async function handleVoices(req, res, url) {
       url.searchParams.get('languages') ||
       TELEGRAM_DEFAULT_LANGUAGE;
 
-    const voices = await listVoices(language);
-    return sendJson(res, 200, { voices });
+    const voices = await listSelectableVoices(language);
+    return sendJson(res, 200, {
+      workspaceId: INWORLD_WORKSPACE_ID,
+      voices,
+      customVoices: voices.filter(isCustomVoice),
+    });
   } catch (error) {
     console.error('[VOICES]', safeError(error));
 
@@ -1046,13 +2067,48 @@ async function handlePreview(req, res, url) {
   }
 
   try {
-    const audio = await getVoicePreview(voiceId, modelId);
+    const resolution = await resolveVoiceReference(
+      voiceId,
+      url.searchParams.get('language') ||
+      url.searchParams.get('lang') ||
+      TELEGRAM_DEFAULT_LANGUAGE
+    );
+
+    if (resolution.status === 'ambiguous') {
+      return sendJson(res, 409, {
+        error: 'Nome de voz ambíguo',
+        matches: resolution.matches
+          .map(voiceCandidateSummary)
+          .filter(Boolean),
+      });
+    }
+
+    if (resolution.status !== 'found') {
+      return sendJson(res, 404, {
+        error: 'Voz não encontrada',
+        message: createVoiceNotFoundError(
+          voiceId
+        ).message,
+      });
+    }
+
+    const resolvedVoice = resolution.voice;
+    const audio = await getVoicePreview(
+      resolvedVoice.voiceId,
+      modelId
+    );
 
     res.writeHead(200, {
       'Content-Type': 'audio/mpeg',
       'Content-Length': audio.length,
       'Content-Disposition': 'inline; filename="preview.mp3"',
       'Cache-Control': 'no-store',
+      'X-Inworld-Voice-Id':
+        resolvedVoice.voiceId,
+      'X-Inworld-Voice-Name':
+        encodeURIComponent(
+          resolvedVoice.displayName
+        ),
       ...CORS,
     });
 
@@ -1319,15 +2375,27 @@ function telegramMenu(chatState) {
     '/clonar Nome | PT_BR | transcrição opcional',
     `Depois envie uma mensagem de voz ou arquivo de áudio com ${CLONE_MIN_SECONDS}-${CLONE_MAX_SECONDS}s.`,
     '',
-    `Voz atual: ${chatState.voiceId}`,
+    `Voz atual: ${
+      chatState.voiceDisplayName ||
+      chatState.voiceId
+    }`,
+    `Voice ID: ${chatState.voiceId}`,
+    `Workspace: ${
+      chatState.voiceWorkspaceId ||
+      INWORLD_WORKSPACE_ID ||
+      'voz do sistema'
+    }`,
     `Modelo: ${chatState.modelId}`,
     `Formato: ${
-      chatState.sendMode === 'voice' ? 'mensagem de voz' : 'arquivo MP3'
+      chatState.sendMode === 'voice'
+        ? 'mensagem de voz'
+        : 'arquivo MP3'
     }`,
     '',
     'Comandos:',
     '/vozes pt - escolher voz',
-    '/voz NOME_OU_ID - definir voz',
+    '/voz NOME_OU_ID - procurar e definir voz',
+    '/workspace - diagnosticar workspace e clonadas',
     '/preview - ouvir voz atual',
     '/clonar ... - iniciar clonagem',
     '/cancelar - cancelar clonagem',
@@ -1346,7 +2414,28 @@ function telegramStatus(chatState) {
 
   return [
     '✅ Ghost1 TTS está ativo',
-    `Voz: ${chatState.voiceId}`,
+    `Voz: ${
+      chatState.voiceDisplayName ||
+      chatState.voiceId
+    }`,
+    `Voice ID: ${chatState.voiceId}`,
+    `Origem: ${
+      chatState.voiceSource ||
+      (
+        chatState.voiceId.includes('__')
+          ? 'IVC'
+          : 'SYSTEM'
+      )
+    }`,
+    `Workspace da voz: ${
+      chatState.voiceWorkspaceId ||
+      voiceWorkspaceId(chatState.voiceId) ||
+      'voz do sistema'
+    }`,
+    `Workspace configurado: ${
+      INWORLD_WORKSPACE_ID ||
+      'derivado da chave da API'
+    }`,
     `Modelo: ${chatState.modelId}`,
     `Idioma: ${chatState.language}`,
     `Formato: ${chatState.sendMode}`,
@@ -1371,9 +2460,97 @@ function callbackTokenForVoice(voice) {
   return hash;
 }
 
+function voiceButtonText(
+  voice,
+  duplicateNames = new Map()
+) {
+  const normalized = normalizeVoiceRecord(voice);
+  const label = voiceLabel(normalized);
+  const key = normalizeVoiceLookup(label);
+  const isDuplicate =
+    (duplicateNames.get(key) || 0) > 1;
+
+  const suffix = isDuplicate
+    ? ` · ${normalized.shortId}`
+    : '';
+
+  const prefix = isCustomVoice(normalized)
+    ? '🧬 '
+    : '';
+
+  return `${prefix}${label}${suffix}`
+    .slice(0, 60);
+}
+
+async function sendVoiceOptionsKeyboard(
+  chatId,
+  title,
+  voices
+) {
+  const normalizedVoices = mergeAndSortVoices(
+    voices
+  ).slice(0, 80);
+
+  if (normalizedVoices.length === 0) {
+    await sendTelegramMessage(
+      chatId,
+      'Nenhuma voz válida foi encontrada.'
+    );
+    return;
+  }
+
+  const duplicateNames = new Map();
+
+  for (const voice of normalizedVoices) {
+    const key = normalizeVoiceLookup(
+      voiceLabel(voice)
+    );
+
+    duplicateNames.set(
+      key,
+      (duplicateNames.get(key) || 0) + 1
+    );
+  }
+
+  const buttons = [];
+
+  for (
+    let index = 0;
+    index < normalizedVoices.length;
+    index += 2
+  ) {
+    const row = normalizedVoices
+      .slice(index, index + 2)
+      .map(voice => ({
+        text: voiceButtonText(
+          voice,
+          duplicateNames
+        ),
+        callback_data:
+          `voice:${callbackTokenForVoice(voice)}`,
+      }));
+
+    buttons.push(row);
+  }
+
+  await sendTelegramMessage(
+    chatId,
+    title,
+    {
+      reply_markup: {
+        inline_keyboard: buttons,
+      },
+    }
+  );
+}
+
 async function sendVoiceKeyboard(chatId, language) {
-  const normalizedLanguage = normalizeLanguage(language);
-  const voices = await listVoices(normalizedLanguage);
+  const normalizedLanguage =
+    normalizeLanguage(language);
+
+  const voices = await listSelectableVoices(
+    normalizedLanguage
+  );
 
   if (voices.length === 0) {
     await sendTelegramMessage(
@@ -1383,42 +2560,148 @@ async function sendVoiceKeyboard(chatId, language) {
     return;
   }
 
-  const visible = voices.slice(0, 40);
-  const buttons = [];
+  const customVoices = voices
+    .filter(isCustomVoice)
+    .sort((a, b) => {
+      const aConfigured =
+        voiceWorkspaceLabel(a) ===
+        INWORLD_WORKSPACE_ID;
 
-  for (let index = 0; index < visible.length; index += 2) {
-    const row = visible.slice(index, index + 2).map(voice => ({
-      text: voice.displayName || voice.voiceId || voice.name || 'Voz',
-      callback_data: `voice:${callbackTokenForVoice(voice)}`,
-    }));
+      const bConfigured =
+        voiceWorkspaceLabel(b) ===
+        INWORLD_WORKSPACE_ID;
 
-    buttons.push(row);
-  }
+      if (aConfigured !== bConfigured) {
+        return Number(bConfigured) -
+          Number(aConfigured);
+      }
+
+      return voiceLabel(a).localeCompare(
+        voiceLabel(b),
+        'pt-BR',
+        { sensitivity: 'base' }
+      );
+    });
+
+  const systemVoices = voices.filter(
+    voice => !isCustomVoice(voice)
+  );
+
+  const visible = [
+    ...customVoices,
+    ...systemVoices.slice(
+      0,
+      Math.max(
+        0,
+        60 - customVoices.length
+      )
+    ),
+  ].slice(0, 80);
+
+  await sendVoiceOptionsKeyboard(
+    chatId,
+    [
+      `Vozes ${normalizedLanguage}:`,
+      `Workspace: ${
+        INWORLD_WORKSPACE_ID ||
+        'derivado da chave'
+      }`,
+      customVoices.length > 0
+        ? `🧬 ${customVoices.length} clonada(s) aparecem primeiro, usando o nome real e não o código do workspace.`
+        : 'Nenhuma voz clonada foi encontrada nesta chave/workspace.',
+      'Toque para selecionar.',
+      `Mostrando ${visible.length} de ${voices.length}.`,
+    ].join('\n'),
+    visible
+  );
+}
+
+async function sendAmbiguousVoiceKeyboard(
+  chatId,
+  query,
+  matches
+) {
+  await sendVoiceOptionsKeyboard(
+    chatId,
+    [
+      `Encontrei mais de uma voz para "${query}".`,
+      'Toque na voz correta:',
+    ].join('\n'),
+    matches
+  );
+}
+
+async function sendWorkspaceDiagnostic(
+  chatId
+) {
+  const voices = await listVoices('');
+  const customVoices = voices.filter(
+    isCustomVoice
+  );
+
+  const workspaces = Array.from(
+    new Set(
+      customVoices
+        .map(voiceWorkspaceLabel)
+        .filter(Boolean)
+    )
+  );
+
+  const configuredVoices = customVoices.filter(
+    voice =>
+      voiceWorkspaceLabel(voice) ===
+      INWORLD_WORKSPACE_ID
+  );
 
   await sendTelegramMessage(
     chatId,
     [
-      `Vozes ${normalizedLanguage}:`,
-      'Toque para selecionar.',
-      `Mostrando ${visible.length} de ${voices.length}.`,
-    ].join('\n'),
-    {
-      reply_markup: {
-        inline_keyboard: buttons,
-      },
-    }
+      '🧬 DIAGNÓSTICO DE VOZES',
+      `Workspace configurado: ${
+        INWORLD_WORKSPACE_ID ||
+        'não definido'
+      }`,
+      `Workspaces encontrados pela chave: ${
+        workspaces.length > 0
+          ? workspaces.join(', ')
+          : 'nenhum'
+      }`,
+      `Vozes clonadas encontradas: ${
+        customVoices.length
+      }`,
+      `Vozes do workspace configurado: ${
+        configuredVoices.length
+      }`,
+      '',
+      configuredVoices.length === 0
+        ? 'Se suas clonadas aparecem no painel mas não aqui, a INWORLD_API_KEY provavelmente pertence a outro workspace ou não possui permissão de leitura.'
+        : 'A chave e o workspace estão enxergando as vozes clonadas.',
+    ].join('\n')
   );
 }
 
-async function generateAndSendTelegramAudio(chatId, text, chatState) {
-  const cleanText = String(text || '').trim();
+async function generateAndSendTelegramAudio(
+  chatId,
+  text,
+  chatState
+) {
+  const cleanText = String(
+    text ||
+    ''
+  ).trim();
 
   if (!cleanText) {
-    await sendTelegramMessage(chatId, 'Envie algum texto para gerar o áudio.');
+    await sendTelegramMessage(
+      chatId,
+      'Envie algum texto para gerar o áudio.'
+    );
     return;
   }
 
-  if (cleanText.length > TELEGRAM_MAX_TEXT_CHARS) {
+  if (
+    cleanText.length >
+    TELEGRAM_MAX_TEXT_CHARS
+  ) {
     await sendTelegramMessage(
       chatId,
       `Texto grande demais. Máximo no Telegram: ${TELEGRAM_MAX_TEXT_CHARS} caracteres.`
@@ -1428,22 +2711,63 @@ async function generateAndSendTelegramAudio(chatId, text, chatState) {
 
   await sendTelegramAction(
     chatId,
-    chatState.sendMode === 'voice' ? 'record_voice' : 'upload_audio'
+    chatState.sendMode === 'voice'
+      ? 'record_voice'
+      : 'upload_audio'
   );
 
-  const generated = await synthesizeLongSpeech({
-    text: cleanText,
-    voiceId: chatState.voiceId,
-    modelId: chatState.modelId,
-  });
-
-  const prepared = await prepareGeneratedAudio(
-    generated.audio,
-    chatState.sendMode
+  let resolvedVoice = await resolveChatVoice(
+    chatState
   );
+
+  let generated;
+
+  try {
+    generated = await synthesizeLongSpeech({
+      text: cleanText,
+      voiceId: resolvedVoice.voiceId,
+      modelId: chatState.modelId,
+    });
+  } catch (error) {
+    if (!isUnknownVoiceError(error)) {
+      throw error;
+    }
+
+    resolvedVoice =
+      await recoverChatVoiceAfterUnknown(
+        chatState
+      );
+
+    try {
+      generated = await synthesizeLongSpeech({
+        text: cleanText,
+        voiceId: resolvedVoice.voiceId,
+        modelId: chatState.modelId,
+      });
+    } catch (retryError) {
+      if (isUnknownVoiceError(retryError)) {
+        throw createVoiceNotFoundError(
+          resolvedVoice.displayName ||
+          resolvedVoice.voiceId,
+          `O ID "${resolvedVoice.voiceId}" também foi recusado pela Inworld.`
+        );
+      }
+
+      throw retryError;
+    }
+  }
+
+  const prepared =
+    await prepareGeneratedAudio(
+      generated.audio,
+      chatState.sendMode
+    );
 
   const caption = [
-    `🎙️ ${chatState.voiceId}`,
+    `🎙️ ${voiceLabel(resolvedVoice)}`,
+    isCustomVoice(resolvedVoice)
+      ? `ID: ${resolvedVoice.voiceId}`
+      : '',
     `Modelo: ${generated.modelId}`,
     generated.chunks > 1
       ? `Texto dividido em ${generated.chunks} chamadas e reunido em um único áudio.`
@@ -1533,9 +2857,15 @@ async function handleCloneAudio(chatId, message, chatState) {
       transcription: chatState.pendingClone.transcription,
     });
 
-    chatState.voiceId = cloned.voice.voiceId;
+    applyVoiceToChatState(
+      chatState,
+      cloned.voice
+    );
+
     chatState.language =
-      cloned.voice.langCode || chatState.pendingClone.langCode;
+      cloned.voice.langCode ||
+      chatState.pendingClone.langCode;
+
     chatState.pendingClone = null;
 
     await saveState();
@@ -1582,7 +2912,15 @@ async function handleTelegramCommand(chatId, text) {
   }
 
   if (command === '/status') {
-    await sendTelegramMessage(chatId, telegramStatus(chatState));
+    await sendTelegramMessage(
+      chatId,
+      telegramStatus(chatState)
+    );
+    return;
+  }
+
+  if (command === '/workspace') {
+    await sendWorkspaceDiagnostic(chatId);
     return;
   }
 
@@ -1598,14 +2936,73 @@ async function handleTelegramCommand(chatId, text) {
     if (!argument) {
       await sendTelegramMessage(
         chatId,
-        `Voz atual: ${chatState.voiceId}\nUse /voz Beatriz ou /vozes pt`
+        [
+          `Voz atual: ${
+            chatState.voiceDisplayName ||
+            chatState.voiceId
+          }`,
+          `Voice ID: ${chatState.voiceId}`,
+          'Use /voz Ultron, /voz ID_COMPLETO ou /vozes pt',
+        ].join('\n')
       );
       return;
     }
 
-    chatState.voiceId = argument;
+    const resolution = await resolveVoiceReference(
+      argument,
+      chatState.language
+    );
+
+    if (resolution.status === 'ambiguous') {
+      await sendAmbiguousVoiceKeyboard(
+        chatId,
+        argument,
+        resolution.matches
+      );
+      return;
+    }
+
+    if (resolution.status !== 'found') {
+      await sendTelegramMessage(
+        chatId,
+        [
+          `❌ Não encontrei a voz "${argument}".`,
+          `Workspace configurado: ${
+            INWORLD_WORKSPACE_ID ||
+            'derivado da chave'
+          }`,
+          'Use /vozes para ver as vozes que esta chave realmente consegue acessar.',
+        ].join('\n')
+      );
+      return;
+    }
+
+    const voice = resolution.voice;
+
+    applyVoiceToChatState(
+      chatState,
+      voice
+    );
+
     await saveState();
-    await sendTelegramMessage(chatId, `✅ Voz alterada para: ${argument}`);
+
+    await sendTelegramMessage(
+      chatId,
+      [
+        '✅ Voz alterada',
+        `Nome: ${voiceLabel(voice)}`,
+        `Voice ID: ${voice.voiceId}`,
+        `Origem: ${voice.source}`,
+        isCustomVoice(voice)
+          ? `Workspace: ${
+              voiceWorkspaceLabel(voice) ||
+              INWORLD_WORKSPACE_ID
+            }`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n')
+    );
     return;
   }
 
@@ -1696,21 +3093,66 @@ async function handleTelegramCommand(chatId, text) {
   }
 
   if (command === '/preview') {
-    await sendTelegramAction(chatId, 'upload_audio');
+    await sendTelegramAction(
+      chatId,
+      'upload_audio'
+    );
 
-    const preview = await getVoicePreview(
-      chatState.voiceId,
-      chatState.modelId
-    );
-    const prepared = await prepareGeneratedAudio(
-      preview,
-      chatState.sendMode
-    );
+    let resolvedVoice =
+      await resolveChatVoice(chatState);
+
+    let preview;
+
+    try {
+      preview = await getVoicePreview(
+        resolvedVoice.voiceId,
+        chatState.modelId
+      );
+    } catch (error) {
+      if (!isUnknownVoiceError(error)) {
+        throw error;
+      }
+
+      resolvedVoice =
+        await recoverChatVoiceAfterUnknown(
+          chatState
+        );
+
+      try {
+        preview = await getVoicePreview(
+          resolvedVoice.voiceId,
+          chatState.modelId
+        );
+      } catch (retryError) {
+        if (isUnknownVoiceError(retryError)) {
+          throw createVoiceNotFoundError(
+            resolvedVoice.displayName ||
+            resolvedVoice.voiceId,
+            `O ID "${resolvedVoice.voiceId}" também foi recusado pela Inworld.`
+          );
+        }
+
+        throw retryError;
+      }
+    }
+
+    const prepared =
+      await prepareGeneratedAudio(
+        preview,
+        chatState.sendMode
+      );
 
     await sendTelegramAudio(
       chatId,
       prepared,
-      `Preview: ${chatState.voiceId}`,
+      [
+        `Preview: ${voiceLabel(resolvedVoice)}`,
+        isCustomVoice(resolvedVoice)
+          ? `ID: ${resolvedVoice.voiceId}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
       chatState.sendMode
     );
     return;
@@ -1802,19 +3244,35 @@ async function handleTelegramCallback(callbackQuery) {
   }
 
   const chatState = getChatState(chatId);
-  chatState.voiceId = voice.voiceId || voice.name;
+  const normalizedVoice =
+    normalizeVoiceRecord(voice);
+
+  applyVoiceToChatState(
+    chatState,
+    normalizedVoice
+  );
+
   await saveState();
 
   await answerCallbackQuery(
     callbackQuery.id,
-    `Voz: ${voice.displayName || chatState.voiceId}`
+    `Voz: ${voiceLabel(normalizedVoice)}`
   );
 
   await sendTelegramMessage(
     chatId,
-    `✅ Voz selecionada: ${
-      voice.displayName || chatState.voiceId
-    }\nID: ${chatState.voiceId}`
+    [
+      `✅ Voz selecionada: ${
+        voiceLabel(normalizedVoice)
+      }`,
+      `ID: ${normalizedVoice.voiceId}`,
+      isCustomVoice(normalizedVoice)
+        ? `Workspace: ${
+            normalizedVoice.workspaceId ||
+            INWORLD_WORKSPACE_ID
+          }`
+        : 'Origem: voz do sistema',
+    ].join('\n')
   );
 }
 
@@ -1837,7 +3295,11 @@ async function configureTelegramBot() {
           description: 'Clonar voz com amostra de 5-15s',
         },
         { command: 'vozes', description: 'Escolher uma voz' },
-        { command: 'voz', description: 'Definir voz por ID' },
+        { command: 'voz', description: 'Definir voz por nome ou ID' },
+        {
+          command: 'workspace',
+          description: 'Diagnosticar workspace e vozes',
+        },
         { command: 'preview', description: 'Ouvir a voz atual' },
         { command: 'teste', description: 'Gerar áudio de teste' },
         { command: 'modelo', description: 'Trocar modelo da Inworld' },
@@ -1931,6 +3393,7 @@ async function handleHttpRequest(req, res) {
       ok: true,
       service: 'tts.ghost1',
       model: MODEL_ID,
+      workspaceId: INWORLD_WORKSPACE_ID,
       port: PORT,
       uptimeSeconds: Math.floor(process.uptime()),
       telegram: {
