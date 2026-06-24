@@ -183,9 +183,16 @@ const CLONE_REMOVE_BACKGROUND_NOISE = boolEnv(
 const DATA_DIR = stringEnv('DATA_DIR', '/app/data');
 const STATE_FILE = path.join(DATA_DIR, 'telegram-state.json');
 
-const INWORLD_AUTH = INWORLD_API_KEY.startsWith('Basic ')
+const INWORLD_AUTH_DEFAULT = INWORLD_API_KEY.startsWith('Basic ')
   ? INWORLD_API_KEY
   : `Basic ${INWORLD_API_KEY}`;
+
+// Chave ativa em runtime — pode ser trocada via /setkey sem reiniciar
+let runtimeInworldAuth = INWORLD_AUTH_DEFAULT;
+
+function getInworldAuth() {
+  return runtimeInworldAuth;
+}
 
 const TELEGRAM_API = TELEGRAM_BOT_TOKEN
   ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
@@ -913,7 +920,7 @@ async function inworldRequest(url, options = {}) {
     const response = await fetch(url, {
       ...options,
       headers: {
-        Authorization: INWORLD_AUTH,
+        Authorization: getInworldAuth(),
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),
         ...(options.headers || {}),
       },
@@ -2399,6 +2406,8 @@ function telegramMenu(chatState) {
     '/preview - ouvir voz atual',
     '/clonar ... - iniciar clonagem',
     '/cancelar - cancelar clonagem',
+    '/setkey - configurar chave Inworld',
+    '/resetkey - resetar chave Inworld',
     '/modelo ID - trocar modelo',
     '/modo audio|voz - formato',
     '/teste - gerar teste',
@@ -3089,6 +3098,82 @@ async function handleTelegramCommand(chatId, text) {
     chatState.pendingClone = null;
     await saveState();
     await sendTelegramMessage(chatId, 'Clonagem cancelada.');
+    return;
+  }
+
+  // ── /setkey NOVA_CHAVE ──────────────────────────────────────
+  if (command === '/setkey') {
+    if (!argument) {
+      await sendTelegramMessage(
+        chatId,
+        [
+          '🔑 Envie a nova chave Inworld:',
+          '/setkey SUA_NOVA_CHAVE',
+          '',
+          'A chave só muda em memória — o .env do Coolify não é alterado.',
+          'Use /resetkey para voltar ao padrão a qualquer hora.',
+        ].join('\n')
+      );
+      return;
+    }
+    const newKey = argument.trim();
+    runtimeInworldAuth = newKey.startsWith('Basic ')
+      ? newKey
+      : `Basic ${newKey}`;
+    clearVoicesCache();
+    const maskedNew = `${newKey.slice(0, 6)}****${newKey.slice(-4)}`;
+    await sendTelegramMessage(
+      chatId,
+      [
+        '✅ Chave Inworld atualizada!',
+        `🔑 ${maskedNew}`,
+        '',
+        'Válida até reiniciar o servidor ou usar /resetkey.',
+        'O .env do Coolify não foi alterado.',
+      ].join('\n')
+    );
+    return;
+  }
+
+  // ── /resetkey ───────────────────────────────────────────────
+  if (command === '/resetkey') {
+    runtimeInworldAuth = INWORLD_AUTH_DEFAULT;
+    clearVoicesCache();
+    const defaultKey = INWORLD_API_KEY.startsWith('Basic ')
+      ? INWORLD_API_KEY.slice(6)
+      : INWORLD_API_KEY;
+    const maskedDef = `${defaultKey.slice(0, 6)}****${defaultKey.slice(-4)}`;
+    await sendTelegramMessage(
+      chatId,
+      [
+        '✅ Chave redefinida para o padrão do Coolify!',
+        `🔑 ${maskedDef}`,
+      ].join('\n')
+    );
+    return;
+  }
+
+  // ── /keyinfo ────────────────────────────────────────────────
+  if (command === '/keyinfo') {
+    const current = runtimeInworldAuth.startsWith('Basic ')
+      ? runtimeInworldAuth.slice(6)
+      : runtimeInworldAuth;
+    const isDefault = runtimeInworldAuth === INWORLD_AUTH_DEFAULT;
+    const masked = `${current.slice(0, 6)}****${current.slice(-4)}`;
+    await sendTelegramMessage(
+      chatId,
+      [
+        `🔑 Chave ativa: ${masked}`,
+        `Origem: ${
+          isDefault
+            ? '🏠 Padrão do Coolify (.env)'
+            : '✏️ Definida via /setkey'
+        }`,
+        '',
+        '/setkey CHAVE — trocar chave',
+        '/resetkey — voltar ao padrão',
+      ].join('\n')
+    );
     return;
   }
 
