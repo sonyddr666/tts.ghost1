@@ -30,18 +30,19 @@ Envie:
 /clonar Minha Voz | PT_BR | Olá, esta é uma amostra da minha voz.
 ```
 
-Depois envie uma mensagem de voz, MP3, WAV, OGG ou outro arquivo de áudio.
+Depois envie uma mensagem de voz, MP3, WAV, OGG ou um vídeo. Para vídeos, o bot extrai a faixa de áudio automaticamente.
 
 O bot:
 
-1. baixa a amostra;
-2. verifica se tem pelo menos 5 segundos;
-3. corta somente a amostra se passar de 15 segundos;
-4. converte para WAV mono, 24 kHz e PCM 16-bit;
-5. chama `POST https://api.inworld.ai/voices/v1/voices:clone`;
-6. recebe o novo `voiceId`;
-7. seleciona automaticamente a voz clonada;
-8. usa essa voz para os próximos textos.
+1. baixa a amostra de áudio ou vídeo;
+2. extrai a faixa de áudio quando a entrada for um vídeo;
+3. verifica se tem pelo menos 5 segundos;
+4. usa somente os primeiros 15 segundos quando a entrada for maior;
+5. converte para WAV mono, 24 kHz e PCM 16-bit;
+6. chama `POST https://api.inworld.ai/voices/v1/voices:clone`;
+7. recebe o novo `voiceId`;
+8. seleciona automaticamente a voz clonada;
+9. usa essa voz para os próximos textos.
 
 Use apenas áudio que você tenha autorização para clonar.
 

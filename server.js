@@ -2806,7 +2806,12 @@ function parseCloneCommand(argument, chatState) {
 }
 
 async function handleCloneAudio(chatId, message, chatState) {
-  const source = message.voice || message.audio || message.document;
+  const source =
+    message.voice ||
+    message.audio ||
+    message.video ||
+    message.video_note ||
+    message.document;
 
   if (!source?.file_id) {
     return false;
@@ -2816,7 +2821,7 @@ async function handleCloneAudio(chatId, message, chatState) {
     await sendTelegramMessage(
       chatId,
       [
-        'Recebi um áudio, mas nenhuma clonagem foi iniciada.',
+        'Recebi um áudio ou vídeo, mas nenhuma clonagem foi iniciada.',
         'Use:',
         '/clonar Nome da Voz | PT_BR | transcrição opcional',
         `Depois envie uma amostra de ${CLONE_MIN_SECONDS}-${CLONE_MAX_SECONDS}s.`,
@@ -2831,11 +2836,12 @@ async function handleCloneAudio(chatId, message, chatState) {
   if (
     message.document &&
     mimeType &&
-    !mimeType.startsWith('audio/')
+    !mimeType.startsWith('audio/') &&
+    !mimeType.startsWith('video/')
   ) {
     await sendTelegramMessage(
       chatId,
-      'O documento enviado não parece ser um arquivo de áudio.'
+      'O documento enviado não parece ser um arquivo de áudio ou vídeo.'
     );
     return true;
   }
@@ -2844,7 +2850,9 @@ async function handleCloneAudio(chatId, message, chatState) {
     await sendTelegramAction(chatId, 'typing');
     await sendTelegramMessage(
       chatId,
-      '🔄 Baixando e preparando a amostra para clonagem...'
+      message.video || message.video_note || mimeType.startsWith('video/')
+        ? '🔄 Baixando o vídeo, extraindo o áudio e preparando a amostra...'
+        : '🔄 Baixando e preparando a amostra para clonagem...'
     );
 
     const originalBuffer = await downloadTelegramFile(source.file_id);
@@ -3282,7 +3290,7 @@ async function handleTelegramMessage(message) {
   if (!text) {
     await sendTelegramMessage(
       chatId,
-      'Envie texto para gerar áudio ou use /clonar antes de enviar uma amostra de voz.'
+      'Envie texto para gerar áudio ou use /clonar antes de enviar um áudio ou vídeo.'
     );
     return;
   }
@@ -3377,7 +3385,7 @@ async function configureTelegramBot() {
         { command: 'start', description: 'Abrir o menu' },
         {
           command: 'clonar',
-          description: 'Clonar voz com amostra de 5-15s',
+          description: 'Clonar voz usando áudio ou vídeo',
         },
         { command: 'vozes', description: 'Escolher uma voz' },
         { command: 'voz', description: 'Definir voz por nome ou ID' },
